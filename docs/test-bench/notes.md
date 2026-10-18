@@ -2,8 +2,8 @@
 
 ## Network layout
 
-The firmware uses **static IPs** (`src/main.cpp` BLOCK 3) — no DHCP for the
-board.
+The firmware uses **static IPs** (`src/micro_ros_bridge.cpp`) — no DHCP
+for the board.
 
 | Device | IP | Notes |
 |---|---|---|
@@ -63,7 +63,7 @@ Never hardcode `/dev/` ports — let `pio` auto-detect USB.
 
 ## Staged bring-up detail (the checklist table lives in README)
 
-Stage 1 expects (from `src/main.cpp`):
+Stage 1 expects (from `src/app.cpp` and the board/controller modules):
 - `[RELAY] initialization completed` (else `INIT FAILED` → red SOLID LED,
   relays inhibited — check I2C/TCA9554)
 - `[CFG] switch->relay bindings valid` (else purple blink)

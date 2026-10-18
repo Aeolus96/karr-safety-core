@@ -1,35 +1,44 @@
-# BLOCK dependency view — mirrors the "FILE STRUCTURE" comment in src/main.cpp.
-# Each block is split-ready into its own .h/.cpp pair.
-direction: down
+# Module ownership and dependency view.
+direction: right
 
-title: "Firmware Blocks — src/main.cpp (5 split-ready blocks)" {
+title: "Firmware Modules — ownership and dependencies" {
   shape: text
 }
 
-relayboard: "BLOCK 1: RelayBoard\nrelay_board.h/.cpp\nTCA9554 + DIN + LED + buzzer\nsingle HW facade" {
+app: "app.cpp + app.h\nWiring, boot order,\ncontrol task + ROS loop" {
+  shape: rectangle
+  style.fill: "#e3f2fd"
+}
+
+relayboard: "RelayBoard\nTCA9554 + DIN + LED + buzzer\nsingle hardware facade" {
   shape: rectangle
   style.fill: "#fff3e0"
 }
 
-rcreceiver: "BLOCK 2: RcReceiver\nrc_receiver.h/.cpp\ni-BUS + channel table\n+ failsafe state machine" {
+receiver: "RcReceiver + rc_config.h\ni-BUS + channel table\nreceiver state machine" {
   shape: rectangle
   style.fill: "#e8f5e9"
 }
 
-microros: "BLOCK 3: MicroRosBridge\nmicro_ros_bridge.h/.cpp\nagent SM + 6 publishers\nPUBLISH-ONLY, no subs" {
-  shape: rectangle
-  style.fill: "#ede7f6"
-}
-
-features: "BLOCK 4: RelayFeatureController\nrelay_feature_controller.h/.cpp\nONLY writer of relays\nbindings + dependency model" {
+controller: "RelayFeatureController\nBindings + permission\nONLY runtime relay writer" {
   shape: rectangle
   style.fill: "#fce4ec"
   style.stroke-width: 3
 }
 
-main: "BLOCK 5: main\nwiring + cooperative loop()\nno logic, just service() order" {
+bridge: "MicroRosBridge\nEthernet + agent state + publishers\nPUBLISH-ONLY, no subscriptions" {
   shape: rectangle
-  style.fill: "#e3f2fd"
+  style.fill: "#ede7f6"
+}
+
+exchange: "State exchange\nLength-one snapshot queue\n+ agent atomic" {
+  shape: rectangle
+  style.fill: "#e0f2f1"
+}
+
+diagnostics: "Diagnostics\nBounded log queue\n+ dropped counter" {
+  shape: rectangle
+  style.fill: "#f3e5f5"
 }
 
 ibus: "lib/IBusBM\nvendored (3.x timer fix)" {
@@ -37,26 +46,24 @@ ibus: "lib/IBusBM\nvendored (3.x timer fix)" {
   style.fill: "#f5f5f5"
 }
 
-# Dependencies (who may touch whom)
-rcreceiver -> relayboard: "observes" {
-  style.stroke-dash: 3
-}
-microros -> relayboard: "observes" {
-  style.stroke-dash: 3
-}
-microros -> rcreceiver: "observes" {
-  style.stroke-dash: 3
-}
-features -> relayboard: "WRITES\nonly path" {
+# Dependencies and handoffs
+app -> relayboard: "owns"
+app -> receiver: "owns"
+app -> controller: "owns"
+app -> bridge: "owns"
+app -> exchange: "initializes + coordinates handoffs"
+app -> diagnostics: "initializes / drains"
+controller -> relayboard: "WRITES\nonly path" {
   style.stroke-width: 2
 }
-features -> rcreceiver: "reads state"
-main -> rcreceiver: "service()"
-main -> features: "service()"
-main -> microros: "service()"
-ibus -> rcreceiver: "uses"
+controller -> receiver: "reads state"
+app -> exchange: "publishes snapshot;\nstores/loads agent state"
+controller -> diagnostics: "zero-wait log enqueue"
+relayboard -> diagnostics: "zero-wait log enqueue"
+receiver -> diagnostics: "zero-wait log enqueue"
+ibus -> receiver: "uses"
 
-rule: "RULE: feature layer never touches Wire/pins/registers" {
+rule: "RULE: bridge never reads live receiver or board state" {
   shape: text
   style.font-color: "#b71c1c"
 }

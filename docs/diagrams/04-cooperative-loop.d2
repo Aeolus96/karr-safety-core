@@ -1,22 +1,38 @@
-# Cooperative loop() — order matters. See loop() at bottom of src/main.cpp.
-# D2 sequence diagram: actors with shape: sequence_diagram.
-shape: sequence_diagram
+# Application execution contexts and cross-task handoffs.
+direction: right
 
-title: "loop() — cooperative order (every iteration)" {
+title: "Control task and ROS loop — execution contexts" {
   shape: text
 }
 
-main: "main loop()"
-rc: "RcReceiver"
-feat: "RelayFeatureController"
-bridge: "MicroRosBridge"
-board: "RelayBoard"
+control: "Control task — core 0\n1 ms cadence:\nRcReceiver::service()\n\nEvery 20 ms:\nRelayFeatureController::service()\nservice indicators + copy snapshot" {
+  shape: rectangle
+  style.fill: "#e8f5e9"
+}
 
-main -> rc: "1. service(now) — i-BUS pump (MUST run every iter)"
-main -> feat: "2. service(agent_connected) — deps + relay write"
-main -> bridge: "3. service(now) — ping + entity SM (bounded ≤100ms)"
-main -> rc: "4. service(now) — re-sample after network work"
-main -> feat: "4b. service(fresh agent state) — no stale decision"
-main -> bridge: "5a. publishReceiverTelemetry 50Hz /rc/joy"
-main -> bridge: "5b. publishBoardTelemetry 1Hz + on-change relay_state"
-main -> board: "6. serviceStatusIndicators + status line"
+rosloop: "Arduino loop — core 1\nDrain up to 16 queued logs\nMicroRosBridge::service()\nStore agent availability\nReceive latest snapshot\nPublish telemetry + status" {
+  shape: rectangle
+  style.fill: "#ede7f6"
+}
+
+snapshot: "Length-one snapshot queue\nzero-wait overwrite" {
+  shape: cylinder
+  style.fill: "#e0f2f1"
+}
+
+logs: "Bounded log queue\nzero-wait producer" {
+  shape: cylinder
+  style.fill: "#f3e5f5"
+}
+
+agent: "Agent availability\nrelease/acquire atomic" {
+  shape: cylinder
+  style.fill: "#fff3e0"
+}
+
+control -> snapshot: "publishes newest copied state"
+snapshot -> rosloop: "non-blocking receive"
+control -> logs: "enqueues events"
+logs -> rosloop: "bounded drain; Serial output"
+rosloop -> agent: "stores after bridge service"
+agent -> control: "loads before feature evaluation"

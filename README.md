@@ -38,7 +38,8 @@ publish-only by design, so no external topic can actuate hardware.
 
 ## Network layout (test bench)
 
-The firmware uses **static IPs** (`src/main.cpp` BLOCK 3) — no DHCP for the
+The firmware uses **static IPs** in
+[`src/micro_ros_bridge.cpp`](src/micro_ros_bridge.cpp) — no DHCP for the
 board, so the router's "randomized MAC" note does not matter here. Just
 reserve/remember the addresses below; the one thing that must match is the
 agent IP the board dials.
@@ -98,16 +99,29 @@ and a generated RC channel map
 
 ## Repository layout
 
-```
-platformio.ini       PIO environment, build flags, micro-ROS config
-micro_ros.meta       micro-ROS entity limits (publishers/subscriptions)
-src/main.cpp         All firmware — organized as 5 split-ready feature blocks
-lib/IBusBM/          Vendored i-BUS library (arduino-esp32 3.x fix)
-partitions_*.csv     16 MB flash partition table
-NOTES.md             Design decisions, safety semantics, validation plans
-docs/diagrams/       D2 onboarding diagrams + notes.md + gen_rc_map.py
-AGENTS.md            Agent working preferences (git safety, docs, platform rules)
-```
+| Module | Ownership |
+| --- | --- |
+| [`src/main.cpp`](src/main.cpp), [`src/app.cpp`](src/app.cpp), [`include/karr/app.h`](include/karr/app.h) | Arduino entry points, subsystem wiring, boot order, control task, ROS-loop orchestration, and periodic status |
+| [`src/relay_board.cpp`](src/relay_board.cpp), [`include/karr/relay_board.h`](include/karr/relay_board.h) | TCA9554 relay writes/retries, digital inputs, LED, buzzer, and board timing |
+| [`include/karr/rc_config.h`](include/karr/rc_config.h), [`src/rc_receiver.cpp`](src/rc_receiver.cpp), [`include/karr/rc_receiver.h`](include/karr/rc_receiver.h) | Channel definitions and i-BUS decoding, receiver state, stop reasons, confirmation, and recovery |
+| [`src/relay_feature_controller.cpp`](src/relay_feature_controller.cpp), [`include/karr/relay_feature_controller.h`](include/karr/relay_feature_controller.h) | Switch-to-relay bindings, validation, feature permission, output mask, and sole runtime relay writer |
+| [`include/karr/control_snapshot.h`](include/karr/control_snapshot.h), [`src/state_exchange.cpp`](src/state_exchange.cpp), [`include/karr/state_exchange.h`](include/karr/state_exchange.h) | Value-only telemetry snapshot, length-one queue, and agent-availability atomic handoff |
+| [`src/diagnostics.cpp`](src/diagnostics.cpp), [`include/karr/diagnostics.h`](include/karr/diagnostics.h) | Bounded queued logging and dropped-event count |
+| [`src/micro_ros_bridge.cpp`](src/micro_ros_bridge.cpp), [`include/karr/micro_ros_bridge.h`](include/karr/micro_ros_bridge.h) | Ethernet/micro-ROS setup, agent lifecycle, ROS entities, topics, QoS, publication, and time sync |
+
+Dependencies flow inward through the application wiring: the feature
+controller uses the receiver and board; the bridge consumes copied
+snapshots; the state-exchange and diagnostics modules provide bounded
+cross-task handoffs. `app.cpp` is the composition root. There are no live
+receiver/board reads in the ROS bridge.
+
+**Where to edit:** receiver channels in [`include/karr/rc_config.h`](include/karr/rc_config.h);
+bindings in [`src/relay_feature_controller.cpp`](src/relay_feature_controller.cpp);
+hardware pins/register constants in [`src/relay_board.cpp`](src/relay_board.cpp);
+network, topic, QoS, and ROS timing settings in [`src/micro_ros_bridge.cpp`](src/micro_ros_bridge.cpp);
+task setup/cadence and boot sequencing in [`src/app.cpp`](src/app.cpp).
+The channel-map generator reads the RC table from `src/rc_receiver.cpp`
+and bindings from `src/relay_feature_controller.cpp`.
 
 ## Status
 

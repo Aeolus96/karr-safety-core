@@ -4,10 +4,22 @@ Baseline firmware for the **K.A.R.R.** (Keystone Autonomous Resource Rover)
 safety & relay controller — the Waveshare **ESP32-S3-POE-ETH-8DI-8RO-C**
 board: micro-ROS over **Ethernet only**, i-BUS RC input (Turnigy TGY-i6S
 transmitter + iA6B receiver), 8 relay outputs, 1 Hz heartbeat/diagnostics. Cooperative application loop with
-BOUNDED blocking ops (see Timing below); no additional application tasks.
-All code in `src/main.cpp`, organized as **5 feature
-blocks** (see file header) ready to split into `.h/.cpp` pairs:
-`RelayBoard` <- `RcReceiver` + `MicroRosBridge` <- `RelayFeatureController` <- main.
+## Architecture: control + ROS tasks (core 0 + core 1)
+
+The firmware is split into two independent tasks so that RC/safety/relays
+never stall behind blocking ROS operations:
+
+- **Control task (core 0)**: samples i-BUS, runs the receiver safety state
+  machine, evaluates features, commands relays, updates status LED/beep.
+  Activated in `app::setup()` via `xTaskCreatePinnedToCore` on core 0.
+- **ROS task (core 1)**: runs `app::loop()` — drains the log queue, services
+  micro-ROS (publish-only), publishes telemetry. Blocked only by
+  micro-ROS entity ops; never delays the control task.
+
+Cooperative ROS application loop with BOUNDED blocking ops (see Timing
+below); no additional application tasks beyond the two above. Arduino
+entry points are thin wrappers in `src/main.cpp`; module headers are in
+`include/karr/` and implementations are in `src/`.
 
 **Naming**: `UPPER_SNAKE_CASE` = compile-time constants (obvious by shape —
 the old `kConstantName` prefix was dropped), `camelCase` = methods/vars,
@@ -39,12 +51,14 @@ live with their feature block, not at the top of the file.
 
 ## Config knobs (each inside its block)
 
-- `RC_CHANNEL_CONFIGURATION[]` (BLOCK 2) — channel type table, currently
+- `RC_CHANNEL_CONFIGURATION[]` in `include/karr/rc_config.h` and
+  `src/rc_receiver.cpp` — channel type table, currently
   **Mode 1**: ch1-ch4 joysticks, ch5/ch6 2-pos, ch7/ch8 3-pos, ch9/ch10 2-pos
 - `RC_RECEIVE_PIN` — **GPIO1** is the *effective* pin of the tested
   prototype (`IBus.begin` re-begins UART1 with rxPin=1, overriding the
   prototype's own `Serial1.begin(21)`)
-- `SWITCH_TO_RELAY_BINDINGS[]` (BLOCK 4) — placeholder switch→relay map;
+- `SWITCH_TO_RELAY_BINDINGS[]` in `src/relay_feature_controller.cpp` —
+  placeholder switch→relay map;
   **the feature names are TYPE PLACEHOLDERS** (front_lighting, beacon,
   work_light, strobe, auxiliary_1) — they are NOT the exact features we
   will build later; only the ch6 wireless e-stop is a defined safety
@@ -54,7 +68,8 @@ live with their feature block, not at the top of the file.
   it gates ROS-dependent features — today that is every feature; it must
   NOT gate future independent features (each group declares its own ROS
   dependency instead)
-- Network (BLOCK 3): board `192.168.0.24`, agent `192.168.0.4:8888`, domain 0
+- Network (`src/micro_ros_bridge.cpp`): board `192.168.0.24`, agent
+  `192.168.0.4:8888`, domain 0
 
 ## Topic contract (publish-only)
 
@@ -79,8 +94,8 @@ written — latest-state snapshots, never a guaranteed transition history.
 
 **Dependency model — board constraints vs feature dependencies:**
 
-Three distinct concepts (matches `RelayFeatureController`, diagram in
-BLOCK 4 of the code):
+Three distinct concepts (matches `RelayFeatureController` and its module
+diagram):
 
 1. **Board-level actuation constraint** — relay hardware completed its
    safe initialization. Applies to EVERY feature; `applyRelayStates()`
@@ -104,7 +119,7 @@ behaviors):
 | Independent safety indication | Not inherently | No | continues its defined indication |
 | Future ROS-reliant functionality | Only if used | Yes | stops / enters its defined fallback |
 
-Composition flow (same diagram in the BLOCK 4 header):
+Composition flow (same diagram in the controller module header):
 
     RC state ──────────┐
     Digital inputs ────┼──> per-group dependency evaluation
@@ -316,8 +331,8 @@ Composition flow (same diagram in the BLOCK 4 header):
   follows its current valid inputs according to that feature's recovery
   policy (a switch left TRUE re-energizes as soon as permission returns).
   Future hazardous outputs may require a per-feature rearm rule in
-  BLOCK 4 after a separate review; that possibility must not introduce a
-  rearm subsystem into the baseline.
+  `relay_feature_controller.cpp` after a separate review; that possibility
+  must not introduce a rearm subsystem into the baseline.
 - **Timing**: cooperative loop with BOUNDED blocking: agent ping <=100 ms,
   one-shot time sync <=100 ms (later cycle), entity create/destroy sessions
   100/200 ms, reliable-publish budget 100 ms, boot-time relay init retries.
@@ -521,4 +536,3 @@ behavior):
   allocation stays until reboot). Abandonments increment the persistent,
   monotonic `support_abandonment_count_` (logged) so reconnect-and-leak
   cycles stay visible.
-
