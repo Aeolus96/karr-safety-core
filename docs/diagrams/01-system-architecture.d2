@@ -1,0 +1,71 @@
+# D2 diagrams are text files — edit the `.d2`, preview live, export `.svg`.
+# direction controls layout flow for the whole board.
+direction: right
+
+title: "KARR Safety Core — System Architecture (onboarding view)" {
+  shape: text
+  near: top-center
+}
+
+# --- Left: human input ---
+tx: "TGY-i6S TX\nMODE 1\n10 channels" {
+  shape: rectangle
+  style.fill: "#e8f5e9"
+}
+rx: "iA6B RX\ni-BUS serial\nch6 = e-stop" {
+  shape: rectangle
+  style.fill: "#e8f5e9"
+}
+
+# --- Middle: firmware under test ---
+esp32: "ESP32-S3-POE-ETH-8DI-8RO-C\nSafety Core FW (src/main.cpp)" {
+  shape: rectangle
+  style.fill: "#e3f2fd"
+  style.stroke-width: 3
+}
+
+# Outputs / inputs on the board
+relays: "8x relays\nTCA9554 I2C\n0x20 (GPIO41/42)" {
+  shape: cylinder
+  style.fill: "#fff3e0"
+}
+inputs: "8x digital inputs\nactive-low\npull-ups" {
+  shape: rectangle
+  style.fill: "#f3e5f5"
+}
+indicators: "status RGB LED\n+ buzzer" {
+  shape: oval
+  style.fill: "#fce4ec"
+}
+
+# --- Right: ROS side (observe-only) ---
+pc: "ROS 2 PC (Jazzy)\nmicro-ROS agent\nudp4 :8888" {
+  shape: rectangle
+  style.fill: "#ede7f6"
+}
+topics: "/rc/joy 50Hz\n/rc/link 1Hz\n/relay_board/* 1Hz" {
+  shape: document
+}
+
+tx -> rx: "2.4 GHz RF"
+rx -> esp32: "i-BUS UART1\nRX=GPIO1, 115200"
+esp32 -> relays: "I2C writes\nall-off 0x00 = safe" {
+  style.stroke-dash: 0
+}
+esp32 -> inputs: "reads"
+esp32 -> indicators: "drives"
+esp32 -> pc: "Ethernet W5500\n192.168.0.24 → .4:8888" {
+  style.stroke-dash: 3
+}
+pc -> topics: "publishes"
+
+# Safety invariant as a labeled note
+note: "INVARIANT: relays NEVER commanded from ROS — publish-only" {
+  shape: text
+  style.font-color: "#b71c1c"
+  style.bold: true
+}
+esp32 -> note: "" {
+  style.stroke: "#b71c1c"
+  style.stroke-dash: 2
+}

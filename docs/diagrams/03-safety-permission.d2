@@ -1,0 +1,49 @@
+# Safety permission model — the core onboarding diagram.
+# "Safe" = all-off 0x00 WRITE request, not confirmed contacts.
+direction: down
+
+title: "Safety Permission — two scopes → one relay write" {
+  shape: text
+}
+
+board_ready: "BOARD-level\nrelay expander safe-init done?\ninit latch + direction OK" {
+  shape: diamond
+  style.fill: "#fff3e0"
+}
+
+rc_ok: "RC group permitted?\n• frames fresh ≤200ms\n• no CONFIRMED failsafe signature (per-channel 200ms)\n• ch6 not decoded-stopped (LOW stops; brief intermediate has grace)\n• no persistent intermediate input (grace expired)\n• agent connected*\n• binding table valid" {
+  shape: diamond
+  style.fill: "#e8f5e9"
+}
+
+compute: "computeRcFeatureRequests()\nTRUE(LOW) switches → relay bits" {
+  shape: rectangle
+}
+
+write_on: "applyRelayStates(bits)\nenergize requested" {
+  shape: rectangle
+  style.fill: "#c8e6c9"
+}
+
+write_safe: "applyRelayStates(0x00)\nSAFE — all-off WRITE" {
+  shape: rectangle
+  style.fill: "#ffcdd2"
+  style.stroke-width: 3
+}
+
+board_ready -> rc_ok: "yes" {
+  style.font-color: "#2e7d32"
+}
+board_ready -> write_safe: "no\n(bus fault)" {
+  style.font-color: "#b71c1c"
+}
+rc_ok -> compute: "yes"
+rc_ok -> write_safe: "no\n(RC / e-stop / agent / cfg)" {
+  style.font-color: "#b71c1c"
+}
+compute -> write_on: "permitted bits"
+compute -> write_safe: "inhibited → 0x00"
+
+legend: "* FORCE_SAFE_ON_AGENT_LOSS=true by default.\nNo global rearm latch — recovery is automatic." {
+  shape: text
+}

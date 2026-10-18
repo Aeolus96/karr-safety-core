@@ -24,16 +24,25 @@
 //      never halts and recovers on its own.
 //
 // DESIGN RULES:
-//   - One cooperative loop(); every periodic action is gated by millis()
-//     arithmetic. This is cooperative scheduling with BOUNDED blocking
-//     operations — the largest documented ones: agent ping <= 100 ms,
-//     one-shot time sync <= 100 ms (on a later cycle than entity creation),
-//     entity create/destroy sessions 100/200 ms, reliable-publish budget
-//     100 ms, bounded boot-time I2C init retries. Remaining operations
-//     (I2C transactions, best-effort publishes, logging) are individually
-//     bounded but NOT individually measured — worst-case loop gaps still
-//     need on-hardware measurement. Cooperative application loop; no
-//     additional application tasks.
+//   - Dual execution context (ESP32 FreeRTOS):
+//     * Core 0 — Control task (pinned, priority configMAX_PRIORITIES-2):
+//       samples i-BUS RC every 1 ms (IBusBM NOTIMER requirement), evaluates
+//       safety features at 50 Hz (20 ms), writes relays, updates indicators.
+//       Never blocks on micro-ROS.
+//     * Core 1 — Arduino loop(): micro-ROS service + telemetry publishing.
+//       May block (ping, entity lifecycle, reliable publish) but cannot
+//       delay the control task.
+//   - Shared state is synchronized, never lock-free: FreeRTOS queues with
+//     a zero-wait producer (control never blocks on ROS; ROS may block and
+//     then reads the newest snapshot) plus one atomic flag with
+//     acquire/release ordering. Control task owns all hardware (UART1,
+//     I2C); ROS task only reads snapshots for telemetry.
+//   - Largest documented blocking operations are now confined to the ROS
+//     context: agent ping <= 100 ms, one-shot time sync <= 100 ms, entity
+//     create/destroy sessions 100/200 ms, reliable-publish budget 100 ms.
+//     The control path runs a nominal 1 ms / 20 ms cadence; worst-case
+//     service gap is NOT yet measured on hardware — the timing counters
+//     report observed maxima, not a certified bound.
 //   - RelayBoard is the single hardware facade. RelayFeatureController is
 //     the only class allowed to write relay states, and it does so behind
 //     board-level actuation constraints + per-feature dependency checks
@@ -94,6 +103,11 @@
 // --- i-BUS RC receiver (LOCAL copy in lib/IBusBM, see platformio.ini) ---
 #include <IBusBM.h>
 
+// --- FreeRTOS (ESP32 Arduino core) — separates RC/safety from blocking ROS ---
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <atomic>
+
 // ============================================================================
 // BLOCK 1: RelayBoard
 // Hardware facade for the Waveshare ESP32-S3-POE-ETH-8DI-8RO-C board: the 8 relays
@@ -119,9 +133,9 @@ constexpr uint8_t TCA9554_CONFIGURATION_REGISTER = 0x03; // 0 = output, 1 = inpu
 // --- Digital inputs DIN1..DIN8 (active-low wiring, internal pull-ups) ---
 constexpr uint8_t DIGITAL_INPUT_PINS[8] = {4, 5, 6, 7, 8, 9, 10, 11};
 
-// --- Status RGB LED + buzzer (driven by millis() gates inside the
-//     cooperative application loop — no additional application tasks;
-//     the vendor used 3 tasks + a shared non-volatile flag for the same job) ---
+// --- Status RGB LED + buzzer (driven from the core-0 control task at
+//     fixed 1 ms / 20 ms cadence; isolated from micro-ROS blocking on
+//     core 1) ---
 constexpr uint8_t STATUS_RGB_LED_PIN = 38;
 constexpr uint8_t STATUS_BUZZER_PIN = 46;
 constexpr uint32_t BUZZER_PWM_FREQUENCY_HZ = 1000;   // uint32_t on purpose:
@@ -143,6 +157,133 @@ constexpr uint32_t RELAY_WRITE_RETRY_PERIOD_MS = 200; // throttle I2C retries
 constexpr uint8_t RELAY_INIT_RETRY_COUNT = 3;         // boot-time init attempts
 constexpr uint32_t RELAY_INIT_RETRY_PERIOD_MS = 50;   // between attempts
 
+// --- Queued log event channel: control task enqueues with zero wait ---
+// Control-task reachable code (RC service, feature evaluation, I2C writes)
+// enqueues events here. loop() on core 1 drains the queue (bounded per
+// iteration — see drainLogQueue) and writes Serial.
+// Zero-wait send: if the queue fills, events are dropped and the counter
+// increments. Logging never blocks the control path. The dropped counter
+// is an atomic: written by control, snapshotted by loop() for diagnostics.
+enum class LogCategory : uint8_t
+{
+    None = 0,
+    RcReceiver = 1,
+    RelayBoard = 2,
+    FeatureController = 3,
+    I2c = 4,
+};
+
+struct LogEvent
+{
+    uint32_t timestamp_ms;
+    uint8_t category;
+    uint8_t code;
+    uint32_t value;
+};
+
+static QueueHandle_t g_log_queue = NULL;
+static std::atomic<uint32_t> g_log_dropped_count{0};
+
+static inline void enqueueLog(LogCategory category, uint8_t code, uint32_t value)
+{
+    if (!g_log_queue)
+    {
+        return;
+    }
+    LogEvent event{millis(), static_cast<uint8_t>(category), code, value};
+    if (xQueueSend(g_log_queue, &event, 0) != pdTRUE)
+    {
+        g_log_dropped_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// Bounded drain: at most DRAIN_MAX_EVENTS per loop() iteration so a
+// sustained event burst cannot indefinitely postpone bridge servicing.
+// Returns the number of events drained.
+static uint32_t drainLogQueue()
+{
+    if (!g_log_queue)
+    {
+        return 0;
+    }
+    constexpr uint8_t DRAIN_MAX_EVENTS = 16;
+    uint32_t drained = 0;
+    LogEvent event;
+    while (drained < DRAIN_MAX_EVENTS && xQueueReceive(g_log_queue, &event, 0) == pdTRUE)
+    {
+        const char *cat_text = "?";
+        switch (static_cast<LogCategory>(event.category))
+        {
+        case LogCategory::RcReceiver:
+            cat_text = "RC";
+            break;
+        case LogCategory::RelayBoard:
+            cat_text = "RELAY";
+            break;
+        case LogCategory::FeatureController:
+            cat_text = "SAFETY";
+            break;
+        case LogCategory::I2c:
+            cat_text = "I2C";
+            break;
+        default:
+            break;
+        }
+        Serial.printf("[LOG %lu %s c=%u v=%lu]\n",
+                      (unsigned long)event.timestamp_ms, cat_text,
+                      event.code, (unsigned long)event.value);
+        ++drained;
+    }
+    return drained;
+}
+
+// --- Coherent telemetry snapshot: control task fills once per safety eval ---
+// --- cycle (20 ms); loop() (core 1) copies it for publishing / status.      ---
+// --- This replaces live cross-core reads of RcReceiver / RelayBoard.        ---
+struct ControlSnapshot
+{
+    uint32_t captured_ms;
+    uint32_t frame_sequence;
+    uint32_t last_valid_frame_ms;
+    uint16_t channels[16];     // RC_CHANNEL_COUNT is 10; IBusBM supports 14
+    uint16_t signature_mask;   // 16-bit: bit N = channel N in narrow window
+    uint8_t receiver_state;    // ReceiverOperatingState
+    bool receiver_local_stop;  // authoritative stop, computed in control
+    uint8_t receiver_stop_reasons; // RECV_STOP_* bits (receiver scope only)
+    uint8_t desired_mask;
+    uint8_t last_written_mask;
+    uint8_t digital_inputs;
+    bool relay_state_known;
+};
+
+static QueueHandle_t g_snapshot_queue = NULL;
+
+static inline void publishSnapshot(const ControlSnapshot &snap)
+{
+    if (!g_snapshot_queue)
+    {
+        return;
+    }
+    // Length-one latest-value: overwrite replaces the queued item even when
+    // full, so the consumer always gets the newest snapshot. Zero-wait for
+    // the producer; ROS may block — its next consumed snapshot is current.
+    xQueueOverwrite(g_snapshot_queue, &snap);
+}
+
+static inline bool receiveSnapshot(ControlSnapshot &snap)
+{
+    if (!g_snapshot_queue)
+    {
+        return false;
+    }
+    return xQueueReceive(g_snapshot_queue, &snap, 0) == pdTRUE;
+}
+
+// --- Shared state between control task (core 0) and ROS task (loop/core 1) ---
+// Synchronized FreeRTOS queues with a zero-wait producer: the control task
+// never blocks on the ROS task; the ROS task may block, and its next
+// consumed snapshot is then the newest. The control task is the sole
+// writer; the ROS task is the sole reader.
 class RelayBoard
 {
 public:
@@ -182,6 +323,11 @@ public:
     bool isRelayStateKnown() const { return relay_state_known_; }
     bool isRelayInitialized() const { return relay_initialized_; }
     uint32_t consecutiveWriteFailures() const { return consecutive_write_failures_; }
+    // Duration of the last I2C register transaction (micros, measured
+    // around Wire.endTransmission inside writeI2cRegister). Control reads
+    // this for honest timing diagnostics — it measures the bus, not the
+    // surrounding feature evaluation.
+    uint32_t lastI2cWriteUs() const { return last_i2c_write_us_; }
 
     // Digital inputs: bit N = 1 means input N+1 is ACTIVE (pulled low).
     uint8_t readDigitalInputs() const;
@@ -190,6 +336,7 @@ public:
     // lives here). blink_interval_ms == 0 means solid-on.
     void setStatusLed(uint8_t red, uint8_t green, uint8_t blue, uint16_t blink_interval_ms);
     void requestStatusBeep(uint32_t duration_ms);
+    void cancelStatusBeep();
     void serviceStatusIndicators(uint32_t now_ms);
 
 private:
@@ -205,6 +352,7 @@ private:
     uint32_t cumulative_write_failures_ = 0;   // diagnostics only
     uint32_t consecutive_write_failures_ = 0;  // retry throttle driver
     uint32_t last_write_attempt_ms_ = 0;
+    uint32_t last_i2c_write_us_ = 0;           // last transaction duration
 
     // Indicator state
     struct StatusLedPattern
@@ -314,9 +462,12 @@ bool RelayBoard::writeI2cRegister(uint8_t device_address, uint8_t register_addre
     Wire.beginTransmission(device_address);
     Wire.write(register_address);
     Wire.write(value);
-    if (Wire.endTransmission(true) != 0)
+    const uint32_t txn_start_us = micros();
+    bool ok = (Wire.endTransmission(true) == 0);
+    last_i2c_write_us_ = micros() - txn_start_us;
+    if (!ok)
     {
-        Serial.println("[I2C] register write: transmission failed");
+        enqueueLog(LogCategory::I2c, 1, device_address);
         return false;
     }
     return true;
@@ -359,7 +510,7 @@ bool RelayBoard::applyRelayStates(uint8_t requested_state_mask)
         last_attempted_mask_ = SAFE_RELAY_STATE;
         if (attemptSafeInitialization())
         {
-            Serial.println("[RELAY] initialization recovered — safe-output write succeeded");
+            enqueueLog(LogCategory::RelayBoard, 3, 0);
             return true;
         }
         return false; // attemptSafeInitialization() counted the failures
@@ -397,8 +548,7 @@ bool RelayBoard::applyRelayStates(uint8_t requested_state_mask)
     ++cumulative_write_failures_;   // diagnostics only
     ++consecutive_write_failures_;  // drives the retry throttle
     relay_state_known_ = false;     // cached mask no longer trustworthy
-    Serial.printf("[RELAY] write failed (mask 0x%02X), consecutive failures=%lu\n",
-                  requested_state_mask, (unsigned long)consecutive_write_failures_);
+    enqueueLog(LogCategory::RelayBoard, 1, requested_state_mask);
     return false;
 }
 
@@ -449,6 +599,16 @@ void RelayBoard::requestStatusBeep(uint32_t duration_ms)
     buzzer_active_ = true;
     buzzer_started_ms_ = millis();
     buzzer_duration_ms_ = duration_ms;
+}
+
+// Cancel a beep that no longer reflects reality: the cutoff was real (relays
+// already went safe) but the slower debounced state never confirmed it —
+// e.g. a switch bouncing through mid-zone, or a glitch that clears before
+// FAILSAFE_CONFIRM_MS. The silence itself says "transient, watch it".
+void RelayBoard::cancelStatusBeep()
+{
+    buzzer_active_ = false;
+    ledcWrite(STATUS_BUZZER_PIN, 0);
 }
 
 void RelayBoard::serviceStatusIndicators(uint32_t now_ms)
@@ -503,6 +663,31 @@ void RelayBoard::serviceStatusIndicators(uint32_t now_ms)
 // receiver-facing safety state
 // machine. Contains NO ROS types and NO board hardware access — split-ready
 // into rc_receiver.h/.cpp with only the IBusBM library as a dependency.
+//
+// RECEIVER BEHAVIOR TABLE (stop conditions, grace, permission; matches
+// RcReceiver::service and NOTES.md "Failsafe detection"):
+//   valid endpoint (LOW/HIGH)        -> own relay request updates next ~20 ms eval
+//   brief intermediate                -> retain last valid endpoint, no global
+//                                        cutoff, bounded by INTERMEDIATE_GRACE_MS
+//   3-pos MID-zone rest past grace    -> effective value resolves to MID
+//                                        (INACTIVE); never failsafe evidence
+//                                        and never an invalid-input stop
+//   narrow signature in fresh frames
+//     for FAILSAFE_CONFIRM_MS         -> confirmed failsafe for that channel
+//   valid CH6 LOW                     -> stop at next control evaluation
+//                                        (no 200 ms wait)
+//   valid CH6 HIGH                    -> release switch-stop (other permissions
+//                                        may still apply)
+//   CH6 intermediate (no endpoint)    -> previous decoded stop retained, at
+//                                        most INTERMEDIATE_GRACE_MS
+//   CH6 implausible / no prior state  -> stop, no grace (boots stopped)
+//   2-pos intermediate past grace     -> RECV_STOP_INVALID_INPUT stop
+//   no fresh frames for timeout       -> RECV_STOP_SIGNAL_LOSS stop
+//   one channel clearing              -> never clears other channels, CH6
+//                                        stop, invalid input, or frame loss
+// Permission (isLocallyInhibited / /relay_board/estop / LED) reads ONLY the
+// authoritative receiver-local stop; brief intermediate or unconfirmed
+// signature input NEVER inhibits by itself.
 // ============================================================================
 
 // --- Receiver link + failsafe detection ---
@@ -521,16 +706,39 @@ constexpr uint32_t RECEIVER_FRAME_TIMEOUT_MS = 200; // i-BUS frames arrive every
 // a universal i-BUS failsafe property): the tested transmitter
 // configuration outputs 1500 on ALL channels when its failsafe fires
 // (observed on the i6S/iA6B pair). For a 2-position switch 1500 is IMPOSSIBLE
-// during healthy operation (it only emits 1000 or 2000, briefly passing
-// through the middle while bouncing). So a configured 2-position channel
-// sitting mid-zone immediately inhibits RC-dependent operation, and if it
-// PERSISTS for FAILSAFE_PERSISTENCE_MS the debounced state is announced
-// as receiver failsafe / e-stop engaged.
-// Joysticks and 3-position switches are excluded — 1500 is legitimate there.
-constexpr uint16_t NO_SIGNAL_RAW_VALUE = 980;       // below = receiver unbound
-constexpr uint16_t TWO_POS_MID_ZONE_LOW = 1250;     // "impossible" 2-pos zone
-constexpr uint16_t TWO_POS_MID_ZONE_HIGH = 1750;
-constexpr uint32_t FAILSAFE_PERSISTENCE_MS = 200;   // debounce vs. switch bounce
+// as a steady healthy value (it only emits 1000 or 2000, briefly passing
+// through the middle while bouncing). A configured 2-position channel inside
+// the NARROW signature window starts per-channel confirmation; only
+// confirmation (or a valid CH6 LOW, or frame timeout, or persistent invalid
+// input) inhibits RC-dependent operation. Brief transitions never cut
+// outputs. Joysticks and 3-position switches are excluded — 1500 is
+// legitimate there.
+// IBusBM keeps delivering receiver frames after RF loss, so the frame
+// counter alone cannot replace configured failsafe-value detection.
+constexpr uint16_t NO_SIGNAL_RAW_VALUE = 980;   // below = receiver unbound
+// Switch endpoint thresholds (EXCLUSIVE boundaries, unchanged semantics):
+// valid LOW endpoint is raw < SWITCH_LOW_THRESHOLD; valid HIGH endpoint is
+// raw > SWITCH_HIGH_THRESHOLD. These drive mapping/activation only — they
+// are deliberately separate from the failsafe signature window below.
+constexpr uint16_t SWITCH_LOW_THRESHOLD = 1250;
+constexpr uint16_t SWITCH_HIGH_THRESHOLD = 1750;
+// Narrow receiver-failsafe signature window (PROVISIONAL bench-test values,
+// not a protocol guarantee): 1490..1510. Verify transmitter-off behavior,
+// startup, and reconnection before treating the tolerance as committed.
+constexpr uint16_t FAILSAFE_CENTER = 1500;
+constexpr uint16_t FAILSAFE_TOLERANCE = 10;
+constexpr uint32_t FAILSAFE_CONFIRM_MS = 200;     // signature confirmation
+// Intermediate-input grace (PROVISIONAL, separately named policy): a channel
+// showing no valid endpoint retains its previous decoded state for at most
+// this long. Same initial value as FAILSAFE_CONFIRM_MS but a different
+// policy — do not merge them.
+constexpr uint32_t INTERMEDIATE_GRACE_MS = 200;
+// Receiver-local stop reason bits (snapshot + logs; receiver scope only —
+// board/agent/config reasons stay distinguishable, see service()).
+constexpr uint8_t RECV_STOP_SIGNAL_LOSS = 1u;
+constexpr uint8_t RECV_STOP_FAILSAFE = 2u;
+constexpr uint8_t RECV_STOP_CH6 = 4u;
+constexpr uint8_t RECV_STOP_INVALID_INPUT = 8u;
 
 // E-stop channel (ch6). TWO roles, both on this channel:
 //   1. No-signal check: raw below NO_SIGNAL_RAW_VALUE = receiver unbound.
@@ -542,10 +750,12 @@ constexpr uint32_t FAILSAFE_PERSISTENCE_MS = 200;   // debounce vs. switch bounc
 //      Never bind this channel to a feature — enforced at startup.
 constexpr uint8_t ESTOP_CHANNEL_INDEX = 5; // ch6 (1-based) = index 5
 
-// Switch ZONE boundaries (shared by mapping, activation and e-stop logic).
-//   LOW zone  : raw <  1250  (position 1000)
-//   MID zone  : 1250..1750   (failsafe 1500 lives here — reads INACTIVE)
-//   HIGH zone : raw >  1750  (position 2000)
+// Switch ZONE boundaries (mapping/activation only — NOT failsafe detection).
+//   LOW zone  : raw <  SWITCH_LOW_THRESHOLD   (position 1000)
+//   MID zone  : SWITCH_LOW_THRESHOLD .. SWITCH_HIGH_THRESHOLD (reads INACTIVE)
+//   HIGH zone : raw >  SWITCH_HIGH_THRESHOLD  (position 2000)
+// The narrow FAILSAFE_CENTER +/- FAILSAFE_TOLERANCE window is the only
+// signature evidence; ordinary MID samples are intermediate input.
 
 // --- Channel configuration table -------------------------------------------
 // >>> EDIT THIS TABLE to match your transmitter / mode setup <<<
@@ -606,12 +816,21 @@ bool channelIsActivated(uint16_t raw_value, const ReceiverChannelConfiguration &
 // --- Receiver operating state -----------------------------------------------
 // SignalActive is the receiver-liveness prerequisite for RC-driven
 // features; it is NOT permission on its own — isLocallyInhibited() adds
-// pending mid-zone ambiguity and the e-stop switch position.
+// CONFIRMED failsafe, decoded CH6 stop, and persistent invalid input.
 enum class ReceiverOperatingState
 {
     SignalLost,       // no frames, or e-stop channel below "no signal" value
-    FailsafeEngaged,  // receiver failsafe signature (2-pos channel stuck mid)
+    FailsafeEngaged,  // confirmed receiver failsafe signature (per-channel 200 ms)
     SignalActive,     // healthy operation
+};
+
+// Per-channel decoded endpoint from one fresh frame.
+enum class ChannelDecode : uint8_t
+{
+    Low,              // valid LOW endpoint  (raw < SWITCH_LOW_THRESHOLD)
+    High,             // valid HIGH endpoint (raw > SWITCH_HIGH_THRESHOLD)
+    Intermediate,     // no valid endpoint, inside plausible range
+    Implausible,      // outside 900..2100 — never valid input
 };
 
 class RcReceiver
@@ -624,46 +843,46 @@ public:
     void service(uint32_t now_ms);
 
     ReceiverOperatingState state() const { return state_; }
-    // Frame state machine: TRUE = fresh frames AND no failsafe signature.
-    // This is liveness only — the e-stop switch or a pending mid-zone
-    // ambiguity can still inhibit operation (see isLocallyInhibited), so
+    // Frame state machine: TRUE = fresh frames AND no CONFIRMED failsafe
+    // signature. This is liveness only — a decoded CH6 stop or persistent
+    // invalid input can still stop operation (see isLocallyInhibited), so
     // "active" is NOT permission to operate.
     bool isSignalActive() const { return state_ == ReceiverOperatingState::SignalActive; }
-    // Persisted receiver-failsafe state (2-pos switch parked mid-zone for
-    // FAILSAFE_PERSISTENCE_MS) — NOT the wireless e-stop switch position
-    // (see isEstopSwitchEngaged) and NOT every stop condition.
+    // Persisted CONFIRMED receiver-failsafe state (narrow signature window
+    // present in fresh frames for FAILSAFE_CONFIRM_MS) — NOT the wireless
+    // e-stop switch position (see decodedCh6Stop()) and NOT every stop
+    // condition.
     bool isFailsafeEngaged() const { return state_ == ReceiverOperatingState::FailsafeEngaged; }
 
-    // WIRELESS E-STOP: the dedicated e-stop switch (ch6). ENGAGED unless
-    // the channel shows a VALID HIGH position (>1750, within the plausible
-    // 900..2100 range) — the failsafe value (1500), implausible values and
-    // "no data yet" (0) all read ENGAGED, so only a deliberate, valid
-    // switch-HIGH releases the e-stop. Boots ENGAGED (raw starts at 0).
-    bool isEstopSwitchEngaged() const
-    {
-        uint16_t raw_value = raw_channels_[ESTOP_CHANNEL_INDEX];
-        bool plausible = (raw_value >= 900 && raw_value <= 2100);
-        bool in_valid_high_zone = plausible && (raw_value > TWO_POS_MID_ZONE_HIGH);
-        return !in_valid_high_zone;
-    }
+    // WIRELESS E-STOP: the dedicated e-stop switch (ch6), DECODED with
+    // intermediate grace. ENGAGED on valid LOW. A valid HIGH releases it.
+    // Brief intermediate input preserves the previous decoded stop state for
+    // at most INTERMEDIATE_GRACE_MS (timer starts on ENTRY, never restarts
+    // on further intermediate samples). No prior valid state, an implausible
+    // value, or grace expiry all read ENGAGED — only a deliberate valid HIGH
+    // releases the e-stop. Boots ENGAGED (raw starts at 0).
+    bool isEstopSwitchEngaged() const { return decoded_ch6_stop_; }
 
     // ONE predicate for ALL receiver-local inhibition: signal loss,
-    // failsafe, pending mid-zone ambiguity, or the wireless e-stop switch.
+    // CONFIRMED failsafe, decoded CH6 stop, or persistent invalid switch
+    // input. Brief intermediate/ambiguous input NEVER inhibits by itself —
+    // only confirmation, valid-LOW CH6, frame timeout, or grace expiry does.
     // The RC-feature permission check, /relay_board/estop and the LED
     // policy all consult this so they can never disagree about
     // receiver-local state. SCOPE: it speaks ONLY for the receiver — not
     // for board-wide relay state, and not for future non-RC features.
-    bool isLocallyInhibited() const
-    {
-        return !isSignalActive() || isMidZoneAmbiguityPresent() || isEstopSwitchEngaged();
-    }
+    bool isLocallyInhibited() const { return receiver_local_stop_; }
 
-    // TRUE while any configured 2-position channel currently sits in the
-    // "impossible" mid-zone (1250-1750) — the ambiguous/failsafe signature.
-    // Pending ambiguity is NOT proven-healthy: the feature layer inhibits
-    // RC-driven features on this immediately, while the announced
-    // FailsafeEngaged state still requires FAILSAFE_PERSISTENCE_MS.
-    bool isMidZoneAmbiguityPresent() const { return mid_zone_present_this_cycle_; }
+    // Authoritative receiver-local stop + reason mask, computed once per
+    // service() — copied into the snapshot, published directly by ROS.
+    // Receiver scope only; board/agent/config reasons stay separate.
+    bool receiverLocalStop() const { return receiver_local_stop_; }
+    uint8_t receiverStopReasons() const { return receiver_stop_reasons_; }
+
+    // TRUE while any configured 2-position channel's signature confirmation
+    // is RUNNING (narrow window, not yet confirmed) — informational only,
+    // never a permission input.
+    bool isSignatureConfirming() const { return signature_confirming_mask_ != 0; }
 
     uint16_t rawChannel(uint8_t index) const { return raw_channels_[index]; }
     const ReceiverChannelConfiguration &channelConfiguration(uint8_t index) const
@@ -671,16 +890,83 @@ public:
         return RC_CHANNEL_CONFIGURATION[index];
     }
     uint8_t channelCount() const { return RC_CHANNEL_COUNT; }
+    uint32_t lastValidFrameMs() const { return last_valid_frame_ms_; }
+    uint8_t lastFrameCounter() const { return last_frame_counter_; }
+    // 16-bit mask: bit N = channel N inside the narrow signature window on
+    // the latest processed frame (informational; confirmation decides).
+    uint16_t signatureMask() const { return latest_frame_signature_mask_; }
+    // Effective switch value for feature requests: the retained last valid
+    // endpoint while a channel is briefly intermediate, else the live raw.
+    // Bounded by INTERMEDIATE_GRACE_MS per channel — see service(). For
+    // 3-pos channels a sustained MID-zone rest resolves to canonical MID
+    // (1500, INACTIVE) at the same bound instead of retaining forever.
+    uint16_t effectiveChannel(uint8_t index) const { return effective_channels_[index]; }
 
 private:
+    // Decode one raw sample into an endpoint category.
+    static ChannelDecode decodeRaw(uint16_t raw_value)
+    {
+        if (raw_value < 900 || raw_value > 2100)
+        {
+            return ChannelDecode::Implausible;
+        }
+        if (raw_value < SWITCH_LOW_THRESHOLD)
+        {
+            return ChannelDecode::Low;
+        }
+        if (raw_value > SWITCH_HIGH_THRESHOLD)
+        {
+            return ChannelDecode::High;
+        }
+        return ChannelDecode::Intermediate;
+    }
+    // TRUE while raw sits inside the narrow failsafe signature window.
+    static bool inSignatureWindow(uint16_t raw_value)
+    {
+        return (raw_value >= FAILSAFE_CENTER - FAILSAFE_TOLERANCE) &&
+               (raw_value <= FAILSAFE_CENTER + FAILSAFE_TOLERANCE);
+    }
+
     IBusBM ibus_protocol_;
     ReceiverOperatingState state_ = ReceiverOperatingState::SignalLost;
     ReceiverOperatingState previous_state_ = ReceiverOperatingState::SignalLost;
     uint16_t raw_channels_[RC_CHANNEL_COUNT] = {0};
+    // Retained last valid endpoint per channel (LOW or HIGH raw value) for
+    // brief-intermediate feature requests. Updated only on valid endpoints.
+    uint16_t effective_channels_[RC_CHANNEL_COUNT] = {0};
     uint8_t last_frame_counter_ = 0;
     uint32_t last_frame_seen_ms_ = 0;
-    uint32_t mid_zone_since_ms_ = 0; // 0 = no 2-pos channel in mid-zone
-    bool mid_zone_present_this_cycle_ = false; // refreshed every service()
+    uint32_t last_valid_frame_ms_ = 0; // time of last valid decoded frame
+    uint16_t latest_frame_signature_mask_ = 0; // channels in narrow window, latest frame
+    uint16_t signature_confirming_mask_ = 0;   // confirmations currently running
+    // Per-channel signature confirmation: timer starts on ENTRY into the
+    // narrow window, never restarts on further signature samples; leaving
+    // the window resets it. Latched confirmed flags clear only on fresh
+    // VALID replacement evidence for that channel (a valid endpoint) —
+    // moving to non-signature intermediate does NOT clear confirmation and
+    // does NOT grant permission (recovery correction C).
+    uint32_t signature_since_ms_[RC_CHANNEL_COUNT] = {0};
+    bool signature_timer_active_[RC_CHANNEL_COUNT] = {false};
+    bool signature_confirmed_[RC_CHANNEL_COUNT] = {false};
+    // Per-channel intermediate episode: timer starts on ENTRY into
+    // intermediate (no valid endpoint), never restarts on further
+    // intermediate samples or on signature/other category changes. A valid
+    // endpoint ends the episode. Past INTERMEDIATE_GRACE_MS with no valid
+    // endpoint -> persistent invalid input fault for that channel.
+    uint32_t intermediate_since_ms_[RC_CHANNEL_COUNT] = {0};
+    bool intermediate_active_[RC_CHANNEL_COUNT] = {false};
+    bool invalid_input_latched_[RC_CHANNEL_COUNT] = {false};
+    // Decoded CH6 stop state with intermediate grace. Valid LOW engages
+    // immediately; valid HIGH releases; intermediate preserves the previous
+    // decoded state for at most INTERMEDIATE_GRACE_MS; implausible engages
+    // without grace; no prior valid state reads ENGAGED (boots stopped).
+    bool decoded_ch6_stop_ = true;
+    uint32_t ch6_intermediate_since_ms_ = 0;
+    bool ch6_intermediate_active_ = false;
+    // Authoritative receiver-local stop + reasons, recomputed every
+    // service() from confirmed evidence only.
+    bool receiver_local_stop_ = true;
+    uint8_t receiver_stop_reasons_ = RECV_STOP_SIGNAL_LOSS;
 };
 
 // ---------------------------------------------------------------------------
@@ -704,14 +990,19 @@ void RcReceiver::service(uint32_t now_ms)
     // 2) Frame freshness via the library's frame counter (volatile, wraps at
     //    256 — inequality compare is safe). IBusBM keeps returning the last
     //    values forever after the receiver dies, so the counter is the only
-    //    trustworthy liveness signal. LIMITATION: the timestamp records when
-    //    a new frame was OBSERVED, not when its bytes arrived — after a long
-    //    service gap (e.g. a stacked 100 ms ping + 100 ms publish), stale
-    //    buffered bytes can refresh freshness. Depth: a 200 ms gap needs
-    //    ~15-28 backlogged frames; measure the worst service gap on
-    //    hardware rather than assuming this cannot happen.
+    //    trustworthy liveness signal. We only treat a frame as "fresh" when
+    //    the counter actually changed — a long service gap (e.g. ROS
+    //    blocking) must not advance wall-clock persistence timers on stale
+    //    buffered bytes.
     uint8_t frame_counter = ibus_protocol_.cnt_rec;
-    if (frame_counter != last_frame_counter_)
+    const bool got_fresh_frame = (frame_counter != last_frame_counter_);
+    // Gap check BEFORE refreshing timestamps (correction: a frame arriving
+    // after a long service gap must invalidate stale persistence evidence,
+    // not smuggle it through by refreshing freshness first).
+    const bool long_gap_since_valid =
+        (last_valid_frame_ms_ != 0) &&
+        ((now_ms - last_valid_frame_ms_) > RECEIVER_FRAME_TIMEOUT_MS);
+    if (got_fresh_frame)
     {
         last_frame_counter_ = frame_counter;
         last_frame_seen_ms_ = now_ms;
@@ -725,63 +1016,261 @@ void RcReceiver::service(uint32_t now_ms)
     }
     uint16_t emergency_stop_raw = raw_channels_[ESTOP_CHANNEL_INDEX];
 
-    // 4) Failsafe signature: any 2-position switch parked in the
-    //    "impossible" mid-zone (failsafe = 1500, or a brief bounce).
-    bool any_two_pos_in_mid_zone = false;
-    for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
+    // 4) Per-channel decode + confirmation (fresh frames only).
+    //    TWO distinct timers per channel:
+    //      intermediate duration = continuous absence of a valid endpoint
+    //        -> bounds how long the previous endpoint may be retained.
+    //      signature duration = continuous fresh-frame evidence inside the
+    //        narrow window -> confirms the receiver-failsafe signature.
+    //    Both start on ENTRY and NEVER restart on further intermediate
+    //    samples, signature/other category changes, or 1500<->1450 wobble.
+    //    A valid endpoint ends the intermediate episode (and, for that
+    //    channel, clears signature confirmation — healthy replacement
+    //    evidence). Leaving the narrow window resets signature confirmation
+    //    but does NOT restore permission.
+    uint16_t signature_mask = 0;
+    if (got_fresh_frame)
     {
-        if (RC_CHANNEL_CONFIGURATION[index].kind != ChannelKind::TwoPositionSwitch)
+        if (long_gap_since_valid)
         {
-            continue;
+            // Stale evidence from before the gap is NOT continuous
+            // confirmation — reset all per-channel timers/flags.
+            for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
+            {
+                signature_since_ms_[index] = 0;
+                signature_timer_active_[index] = false;
+                signature_confirmed_[index] = false;
+                intermediate_since_ms_[index] = 0;
+                intermediate_active_[index] = false;
+                invalid_input_latched_[index] = false;
+            }
+            signature_confirming_mask_ = 0;
+            ch6_intermediate_since_ms_ = 0;
+            ch6_intermediate_active_ = false;
         }
-        if (raw_channels_[index] >= TWO_POS_MID_ZONE_LOW &&
-            raw_channels_[index] <= TWO_POS_MID_ZONE_HIGH)
+        last_valid_frame_ms_ = now_ms;
+        for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
         {
-            any_two_pos_in_mid_zone = true;
+            const ChannelKind kind = RC_CHANNEL_CONFIGURATION[index].kind;
+            if (kind == ChannelKind::AnalogAxis)
+            {
+                continue; // joysticks are telemetry-only — never decoded
+            }
+            ChannelDecode decode = decodeRaw(raw_channels_[index]);
+            if (kind == ChannelKind::ThreePositionSwitch)
+            {
+                // 3-pos channels maintain ONLY the effective feature value
+                // (feature requests read effectiveChannel()). NO signature
+                // confirmation — MID sits exactly at the 1500 failsafe
+                // center, where 1500 is legitimate input — and NO
+                // invalid-input latch — MID is a legitimate resting
+                // position, so a sustained MID-zone rest must never stop
+                // the system or its other channels.
+                if (decode == ChannelDecode::Low || decode == ChannelDecode::High)
+                {
+                    // Valid endpoint: healthy replacement evidence — updates
+                    // the relay request at the next ~20 ms evaluation and
+                    // ends any sweep episode.
+                    effective_channels_[index] = raw_channels_[index];
+                    intermediate_active_[index] = false;
+                    intermediate_since_ms_[index] = 0;
+                }
+                else
+                {
+                    // Intermediate (sweep through the MID zone, or resting
+                    // in MID) or Implausible: retain the previous effective
+                    // value through a brief sweep so switch bounce cannot
+                    // chatter the relay, then resolve a SUSTAINED rest to
+                    // canonical MID (1500 -> INACTIVE for every feature).
+                    // Deliberately NOT the 2-pos semantics: there, grace
+                    // expiry latches invalid input and stops; here MID is
+                    // legitimate, so expiry resolves the VALUE instead.
+                    // Timer starts on ENTRY and never restarts — same
+                    // episode rules as the 2-pos path. The episode arrays
+                    // are safe to share with the 2-pos path: channel kinds
+                    // are disjoint per index, and both reset paths (long
+                    // gap, signal loss) already clear them for every index.
+                    if (!intermediate_active_[index])
+                    {
+                        intermediate_active_[index] = true;
+                        intermediate_since_ms_[index] = now_ms;
+                    }
+                    if ((now_ms - intermediate_since_ms_[index]) >= INTERMEDIATE_GRACE_MS)
+                    {
+                        effective_channels_[index] = FAILSAFE_CENTER;
+                    }
+                }
+                continue; // signature / invalid-input logic below is 2-pos only
+            }
+            bool in_window = inSignatureWindow(raw_channels_[index]);
+            if (in_window)
+            {
+                signature_mask |= (1u << index);
+            }
+            if (decode == ChannelDecode::Low || decode == ChannelDecode::High)
+            {
+                // Valid endpoint: healthy replacement evidence for THIS
+                // channel only. Ends its intermediate episode, clears its
+                // invalid latch and its signature confirmation.
+                effective_channels_[index] = raw_channels_[index];
+                intermediate_since_ms_[index] = 0;
+                intermediate_active_[index] = false;
+                invalid_input_latched_[index] = false;
+                signature_since_ms_[index] = 0;
+                signature_timer_active_[index] = false;
+                signature_confirmed_[index] = false;
+            }
+            else if (decode == ChannelDecode::Implausible)
+            {
+                // Implausible: ordinary channels latch invalid input at
+                // once; CH6 is handled in its own decode below. Signature
+                // confirmation cannot run on implausible input.
+                if (index != ESTOP_CHANNEL_INDEX)
+                {
+                    invalid_input_latched_[index] = true;
+                }
+                signature_since_ms_[index] = 0;
+                signature_timer_active_[index] = false;
+                signature_confirmed_[index] = false;
+            }
+            else // Intermediate, plausible
+            {
+                // Episode timer starts on ENTRY only — never restarts.
+                if (!intermediate_active_[index])
+                {
+                    intermediate_active_[index] = true;
+                    intermediate_since_ms_[index] = now_ms;
+                }
+                if ((now_ms - intermediate_since_ms_[index]) >= INTERMEDIATE_GRACE_MS)
+                {
+                    if (index != ESTOP_CHANNEL_INDEX)
+                    {
+                        invalid_input_latched_[index] = true;
+                    }
+                }
+                // Signature timer starts on ENTRY into the window only.
+                if (in_window)
+                {
+                    if (!signature_timer_active_[index] && !signature_confirmed_[index])
+                    {
+                        signature_timer_active_[index] = true;
+                        signature_since_ms_[index] = now_ms;
+                    }
+                    if (signature_timer_active_[index] &&
+                        (now_ms - signature_since_ms_[index]) >= FAILSAFE_CONFIRM_MS)
+                    {
+                        signature_confirmed_[index] = true;
+                    }
+                }
+                else
+                {
+                    // Left the window: reset signature confirmation, but the
+                    // intermediate episode continues — NOT permission.
+                    signature_since_ms_[index] = 0;
+                    signature_timer_active_[index] = false;
+                    signature_confirmed_[index] = false;
+                }
+            }
+        }
+        latest_frame_signature_mask_ = signature_mask;
+        signature_confirming_mask_ = 0;
+        for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
+        {
+            if (signature_timer_active_[index] && !signature_confirmed_[index])
+            {
+                signature_confirming_mask_ |= (1u << index);
+            }
+        }
+        // CH6 decoded stop: valid endpoints end the grace episode at once.
+        ChannelDecode ch6_decode = decodeRaw(emergency_stop_raw);
+        if (ch6_decode == ChannelDecode::Low)
+        {
+            decoded_ch6_stop_ = true;
+            ch6_intermediate_since_ms_ = 0;
+            ch6_intermediate_active_ = false;
+        }
+        else if (ch6_decode == ChannelDecode::High)
+        {
+            decoded_ch6_stop_ = false;
+            ch6_intermediate_since_ms_ = 0;
+            ch6_intermediate_active_ = false;
+        }
+        else if (ch6_decode == ChannelDecode::Implausible)
+        {
+            decoded_ch6_stop_ = true;
+            ch6_intermediate_since_ms_ = 0;
+            ch6_intermediate_active_ = false;
+        }
+        else // Intermediate: retain previous decoded state, bounded
+        {
+            if (!ch6_intermediate_active_)
+            {
+                ch6_intermediate_active_ = true;
+                ch6_intermediate_since_ms_ = now_ms;
+            }
+            if ((now_ms - ch6_intermediate_since_ms_) >= INTERMEDIATE_GRACE_MS)
+            {
+                decoded_ch6_stop_ = true;
+            }
         }
     }
-    if (any_two_pos_in_mid_zone)
+    else if (!frames_fresh)
     {
-        if (mid_zone_since_ms_ == 0)
+        // Receiver lost: invalidate all per-channel evidence. Confirmation
+        // restarts on fresh frames after signal returns. decoded_ch6_stop_
+        // is recomputed below from signal loss (stays stopped).
+        for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
         {
-            mid_zone_since_ms_ = now_ms; // first sighting — start debounce
+            signature_since_ms_[index] = 0;
+            signature_timer_active_[index] = false;
+            signature_confirmed_[index] = false;
+            intermediate_since_ms_[index] = 0;
+            intermediate_active_[index] = false;
+            invalid_input_latched_[index] = false;
         }
+        latest_frame_signature_mask_ = 0;
+        signature_confirming_mask_ = 0;
+        ch6_intermediate_since_ms_ = 0;
+        ch6_intermediate_active_ = false;
     }
-    else
-    {
-        mid_zone_since_ms_ = 0; // bounce passed — reset debounce
-    }
-    bool failsafe_signature = (mid_zone_since_ms_ != 0) &&
-                              (now_ms - mid_zone_since_ms_) >= FAILSAFE_PERSISTENCE_MS;
-    mid_zone_present_this_cycle_ = any_two_pos_in_mid_zone;
+    // No fresh frame but frames still fresh: all per-channel evidence
+    // carries over unchanged (cached latest-valid-frame state).
 
-    // 5) State / permission decision map (receiver-local scope):
+    // 5) State + authoritative receiver-local stop (computed ONCE here).
     //
     //    Decoded frames fresh AND ch6 not below unbound threshold?
     //        |
-    //        +-- No --> SignalLost ---> RC-dependent features inhibited
+    //        +-- No --> SignalLost ---> receiver-local stop (signal loss)
     //        |
-    //        +-- Yes --> Any configured 2-position switch in mid-zone?
+    //        +-- Yes --> Any 2-pos channel with CONFIRMED signature?
     //                        |
-    //                        +-- Yes --> immediate RC-local inhibit
-    //                        |              |
-    //                        |              +-- persists >200 ms?
-    //                        |                      +-- Yes --> FailsafeEngaged
+    //                        +-- Yes --> FailsafeEngaged -> stop (failsafe)
     //                        |
-    //                        +-- No --> state may be SignalActive
+    //                        +-- No --> state is SignalActive (liveness);
+    //                                   stop still applies for decoded CH6
+    //                                   stop or persistent invalid input.
     //
-    //    Separately: ch6 not a plausible HIGH position --> wireless stop engaged
-    //
-    //    Receiver-local inhibit (isLocallyInhibited) =
-    //        signal not active OR mid-zone ambiguity OR wireless stop engaged
-    //
-    //    Immediate inhibition and the debounced, ANNOUNCED FailsafeEngaged
-    //    state are deliberately distinct (switch bounce immunity).
+    //    Brief intermediate / unconfirmed signature NEVER stops by itself.
+    //    "Immediate" CH6 LOW means the next 20 ms feature evaluation, not
+    //    necessarily this 1 ms iteration.
+    bool any_signature_confirmed = false;
+    bool any_invalid_input = false;
+    for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
+    {
+        if (signature_confirmed_[index])
+        {
+            any_signature_confirmed = true;
+        }
+        if (invalid_input_latched_[index])
+        {
+            any_invalid_input = true;
+        }
+    }
     if (!frames_fresh || emergency_stop_raw < NO_SIGNAL_RAW_VALUE)
     {
         state_ = ReceiverOperatingState::SignalLost;
     }
-    else if (failsafe_signature)
+    else if (any_signature_confirmed)
     {
         state_ = ReceiverOperatingState::FailsafeEngaged;
     }
@@ -789,6 +1278,27 @@ void RcReceiver::service(uint32_t now_ms)
     {
         state_ = ReceiverOperatingState::SignalActive;
     }
+    // Authoritative stop: signal loss, confirmed failsafe, decoded CH6
+    // stop, or persistent invalid input. Recomputed from confirmed
+    // evidence every service() — clearing one reason never clears another.
+    receiver_stop_reasons_ = 0;
+    if (!frames_fresh || emergency_stop_raw < NO_SIGNAL_RAW_VALUE)
+    {
+        receiver_stop_reasons_ |= RECV_STOP_SIGNAL_LOSS;
+    }
+    if (any_signature_confirmed)
+    {
+        receiver_stop_reasons_ |= RECV_STOP_FAILSAFE;
+    }
+    if (decoded_ch6_stop_ && frames_fresh && emergency_stop_raw >= NO_SIGNAL_RAW_VALUE)
+    {
+        receiver_stop_reasons_ |= RECV_STOP_CH6;
+    }
+    if (any_invalid_input && frames_fresh && emergency_stop_raw >= NO_SIGNAL_RAW_VALUE)
+    {
+        receiver_stop_reasons_ |= RECV_STOP_INVALID_INPUT;
+    }
+    receiver_local_stop_ = (receiver_stop_reasons_ != 0);
 
     // 6) Transition logging (beeps are requested by the feature layer, which
     //    watches these transitions — the receiver stays free of board deps).
@@ -797,13 +1307,13 @@ void RcReceiver::service(uint32_t now_ms)
         switch (state_)
         {
         case ReceiverOperatingState::SignalLost:
-            Serial.println("[RC] SIGNAL LOST");
+            enqueueLog(LogCategory::RcReceiver, 1, 0);
             break;
         case ReceiverOperatingState::FailsafeEngaged:
-            Serial.println("[RC] FAILSAFE ENGAGED — a 2-pos switch parked mid-zone >200ms (tested transmitter failsafe: 1500 on all channels)");
+            enqueueLog(LogCategory::RcReceiver, 2, 0);
             break;
         case ReceiverOperatingState::SignalActive:
-            Serial.println("[RC] signal active — link OK");
+            enqueueLog(LogCategory::RcReceiver, 3, 0);
             break;
         }
         previous_state_ = state_;
@@ -830,13 +1340,13 @@ float mapChannelValueToJoyAxis(uint16_t raw_value, const ReceiverChannelConfigur
     case ChannelKind::TwoPositionSwitch:
         // SWITCH POLARITY: TRUE/active when LOW (1000). MID (failsafe 1500)
         // and HIGH (2000) both read False/inactive.
-        mapped_value = (raw_value < TWO_POS_MID_ZONE_LOW) ? 1.0f : 0.0f;
+        mapped_value = (raw_value < SWITCH_LOW_THRESHOLD) ? 1.0f : 0.0f;
         break;
     case ChannelKind::ThreePositionSwitch:
         // LOW = 1.0, MID (failsafe) = 0.0, HIGH = -1.0 — the failsafe value
         // sits at neutral 0 for every downstream feature.
-        if (raw_value < TWO_POS_MID_ZONE_LOW)       mapped_value = 1.0f;
-        else if (raw_value > TWO_POS_MID_ZONE_HIGH) mapped_value = -1.0f;
+        if (raw_value < SWITCH_LOW_THRESHOLD)       mapped_value = 1.0f;
+        else if (raw_value > SWITCH_HIGH_THRESHOLD) mapped_value = -1.0f;
         else                                        mapped_value = 0.0f;
         break;
     }
@@ -865,7 +1375,7 @@ bool channelIsActivated(uint16_t raw_value, const ReceiverChannelConfiguration &
     {
         // TRUE position = LOW zone (1000). MID (failsafe) and HIGH are
         // inactive — the failsafe value can never activate a feature.
-        return raw_value < TWO_POS_MID_ZONE_LOW;
+        return raw_value < SWITCH_LOW_THRESHOLD;
     }
     return false; // analog axes never "activate"
 }
@@ -945,9 +1455,10 @@ public:
     const char *agentStateText() const;
 
     // Telemetry publishers (all no-ops while the agent is not connected).
-    void publishReceiverTelemetry(const RcReceiver &receiver, uint32_t now_ms);
-    void publishBoardTelemetry(const RelayBoard &board, const RcReceiver &receiver,
-                               uint32_t now_ms);
+    // Consume a coherent ControlSnapshot filled by the control task — no
+    // live cross-core reads of RcReceiver / RelayBoard.
+    void publishReceiverTelemetry(const ControlSnapshot &snapshot, uint32_t now_ms);
+    void publishBoardTelemetry(const ControlSnapshot &snapshot, uint32_t now_ms);
 
 private:
     bool initializeEntities();
@@ -1597,7 +2108,7 @@ void MicroRosBridge::service(uint32_t now_ms)
     }
 }
 
-void MicroRosBridge::publishReceiverTelemetry(const RcReceiver &receiver, uint32_t now_ms)
+void MicroRosBridge::publishReceiverTelemetry(const ControlSnapshot &snapshot, uint32_t now_ms)
 {
     if (!isAgentConnected())
     {
@@ -1609,18 +2120,17 @@ void MicroRosBridge::publishReceiverTelemetry(const RcReceiver &receiver, uint32
     }
     last_joy_publish_ms_ = now_ms;
 
-    // While the receiver is unhealthy we still publish — but zeroed — so
-    // consumers can tell "board alive, RC data neutral" apart from "board
-    // dead" using the heartbeat + /rc/link pair. NOTE: this zeroes on
-    // frame-loss/failsafe only (isSignalActive) — the e-stop switch and
-    // pending ambiguity still publish their real positions, and
-    // /rc/link is frame-state liveness, not permission to operate.
-    bool receiver_healthy = receiver.isSignalActive();
-    uint8_t channel_count = receiver.channelCount();
+    // Receiver health from the coherent snapshot: SignalActive means fresh
+    // frames and no failsafe signature. While unhealthy we still publish
+    // — but zeroed — so consumers can tell "board alive, RC data neutral"
+    // apart from "board dead" using the heartbeat + /rc/link pair.
+    bool receiver_healthy = (snapshot.receiver_state ==
+                             static_cast<uint8_t>(ReceiverOperatingState::SignalActive));
+    uint8_t channel_count = RC_CHANNEL_COUNT;
     for (uint8_t index = 0; index < channel_count; ++index)
     {
-        uint16_t raw_value = receiver.rawChannel(index);
-        const ReceiverChannelConfiguration &configuration = receiver.channelConfiguration(index);
+        uint16_t raw_value = snapshot.channels[index];
+        const ReceiverChannelConfiguration &configuration = RC_CHANNEL_CONFIGURATION[index];
         joy_axes_storage_[index] =
             receiver_healthy ? mapChannelValueToJoyAxis(raw_value, configuration) : 0.0f;
         joy_buttons_storage_[index] =
@@ -1647,8 +2157,7 @@ void MicroRosBridge::publishReceiverTelemetry(const RcReceiver &receiver, uint32
     publishTelemetryMessage(&joy_publisher_, &joy_message_);
 }
 
-void MicroRosBridge::publishBoardTelemetry(const RelayBoard &board,
-                                           const RcReceiver &receiver, uint32_t now_ms)
+void MicroRosBridge::publishBoardTelemetry(const ControlSnapshot &snapshot, uint32_t now_ms)
 {
     if (!isAgentConnected())
     {
@@ -1664,7 +2173,7 @@ void MicroRosBridge::publishBoardTelemetry(const RelayBoard &board,
     // NOTE: latest-state SNAPSHOTS, not a guaranteed event history — a
     // failed transition can be superseded by newer state even with
     // reliable QoS.
-    uint8_t relay_states = board.lastWrittenRelayStates();
+    uint8_t relay_states = snapshot.last_written_mask;
     bool periodic_due = (now_ms - last_health_publish_ms_) >= HEALTH_PUBLISH_PERIOD_MS;
     bool relay_new_target =
         !relay_attempt_exists_ || (relay_states != last_attempted_relay_state_);
@@ -1698,23 +2207,21 @@ void MicroRosBridge::publishBoardTelemetry(const RelayBoard &board,
         publishTelemetryMessage(&heartbeat_publisher_, &heartbeat_message_); // counter = wedged device
 
         // SEMANTICS: /rc/link = frame-state liveness (fresh frames, no
-        // failsafe signature) — NOT permission to operate; the e-stop
-        // switch and pending ambiguity can still inhibit locally.
-        link_message_.data = receiver.isSignalActive();
+        // CONFIRMED failsafe signature) — NOT permission to operate; the
+        // decoded CH6 stop and persistent invalid input can still stop
+        // locally.
+        link_message_.data = (snapshot.receiver_state ==
+                              static_cast<uint8_t>(ReceiverOperatingState::SignalActive));
         publishTelemetryMessage(&link_publisher_, &link_message_);
 
-        inputs_message_.data = board.readDigitalInputs();
+        inputs_message_.data = snapshot.digital_inputs;
         publishTelemetryMessage(&inputs_publisher_, &inputs_message_);
 
-        // SEMANTICS: /relay_board/estop = receiver.isLocallyInhibited() —
-        // ONE predicate covering the e-stop switch, failsafe, mid-zone
-        // ambiguity and signal loss, matching the RC-feature permission
-        // check exactly. It reports RECEIVER-LOCAL inhibition only: NOT a
-        // board-wide relay-off indication and NOT a permission-to-operate
-        // signal. With independent features it may be TRUE while an
-        // independent safety indication stays active — that is scope, not
-        // contradiction.
-        estop_message_.data = receiver.isLocallyInhibited();
+        // SEMANTICS: /relay_board/estop = authoritative receiver-local stop,
+        // computed once in control and copied here — never rebuilt from raw
+        // fields. Receiver scope only; board/agent/config reasons are
+        // reported separately (LED, status line, reason-code logs).
+        estop_message_.data = snapshot.receiver_local_stop;
         publishTelemetryMessage(&estop_publisher_, &estop_message_);
     }
 
@@ -1916,6 +2423,10 @@ public:
     // (No clock input: these decisions are purely combinational on the
     // latest receiver/board state.)
     void service(bool agent_connected);
+    // Last desired (target) relay mask computed by service() — for the
+    // coherent telemetry snapshot. Differs from lastWrittenRelayStates()
+    // when an I2C write failed.
+    uint8_t lastDesiredMask() const { return last_desired_mask_; }
 
 private:
     // BOARD-LEVEL actuation constraint — applies to every feature, no
@@ -1942,6 +2453,9 @@ private:
     // Boot default: ENGAGED (matches RcReceiver::isEstopSwitchEngaged()
     // before the first frames — raw values start at 0).
     bool previous_estop_switch_engaged_ = true;
+    // Last desired relay target computed by service() — updated every
+    // safety evaluation cycle for the coherent snapshot.
+    uint8_t last_desired_mask_ = SAFE_RELAY_STATE;
 };
 
 // ---------------------------------------------------------------------------
@@ -1960,9 +2474,9 @@ bool RelayFeatureController::boardActuationReady() const
 
 bool RelayFeatureController::rcFeaturesPermitted(bool agent_connected) const
 {
-    // Dependency 1 — receiver-local inhibition: signal loss, failsafe,
-    // pending mid-zone ambiguity and the wireless e-stop switch are all
-    // covered by ONE predicate, so this permission check, the
+    // Dependency 1 — receiver-local inhibition: signal loss, CONFIRMED
+    // failsafe, decoded CH6 stop and persistent invalid switch input are
+    // all covered by ONE predicate, so this permission check, the
     // /relay_board/estop topic and the LED policy can never disagree
     // about receiver-local state.
     if (receiver_.isLocallyInhibited())
@@ -1990,10 +2504,12 @@ bool RelayFeatureController::rcFeaturesPermitted(bool agent_connected) const
 uint8_t RelayFeatureController::computeRcFeatureRequests() const
 {
     // RC-group output requests: switch in its TRUE (LOW) position ->
-    // request its bound relay. Bindings failing validation are skipped
-    // here as well as flagged at startup — a bad edit degrades
-    // gracefully, never reads out of bounds, and never actuates a
-    // safety-reserved channel.
+    // request its bound relay. Uses the receiver's EFFECTIVE channel value
+    // (retained last valid endpoint during brief intermediate input), so a
+    // switch bouncing through the middle does not chatter its own relay.
+    // Bindings failing validation are skipped here as well as flagged at
+    // startup — a bad edit degrades gracefully, never reads out of bounds,
+    // and never actuates a safety-reserved channel.
     uint8_t desired_state = SAFE_RELAY_STATE;
     for (uint8_t binding_index = 0; binding_index < SWITCH_TO_RELAY_BINDING_COUNT; ++binding_index)
     {
@@ -2002,7 +2518,7 @@ uint8_t RelayFeatureController::computeRcFeatureRequests() const
         {
             continue; // invalid/reserved binding — flagged at startup
         }
-        uint16_t raw_value = receiver_.rawChannel(binding.rc_channel_index);
+        uint16_t raw_value = receiver_.effectiveChannel(binding.rc_channel_index);
         const ReceiverChannelConfiguration &configuration =
             receiver_.channelConfiguration(binding.rc_channel_index);
         if (channelIsActivated(raw_value, configuration))
@@ -2050,13 +2566,14 @@ void RelayFeatureController::service(bool agent_connected)
 
     // --- Output composition + board constraints -> the single write site ---
     uint8_t target_state = computeDesiredRelayState(agent_connected);
+    last_desired_mask_ = target_state; // record for coherent telemetry snapshot
 
     // --- Relay actuation (the only relay write site in the firmware) ---
     uint8_t state_before = relay_board_.lastWrittenRelayStates();
     bool write_confirmed = relay_board_.applyRelayStates(target_state);
     if (relay_board_.lastWrittenRelayStates() != state_before)
     {
-        Serial.printf("[RELAY] state -> 0x%02X\n", relay_board_.lastWrittenRelayStates());
+        enqueueLog(LogCategory::RelayBoard, 2, relay_board_.lastWrittenRelayStates());
     }
 
     if (board_actuation_ready != previous_board_actuation_ready_ ||
@@ -2067,31 +2584,45 @@ void RelayFeatureController::service(bool agent_connected)
         // rather than a bare open/closed verdict.
         if (!board_actuation_ready)
         {
-            Serial.printf("[SAFETY] BOARD constraint: relay hardware not initialized — "
-                          "every feature commanded 0x%02X (target=0x%02X)\n",
-                          (unsigned)SAFE_RELAY_STATE, target_state);
+            enqueueLog(LogCategory::FeatureController, 1, target_state);
         }
         else if (!rc_features_permitted)
         {
             // Scoped reasons for the RC group; config health has no topic,
-            // so it is reported here (plus LED + startup log).
-            Serial.printf("[SAFETY] RC features INHIBITED "
-                          "(receiver_local=%s, agent=%s, rc_config=%s) — "
-                          "RC-driven outputs to 0x%02X\n",
-                          receiver_.isLocallyInhibited() ? "STOPPED" : "ok",
-                          agent_connected ? "connected" : "down",
-                          switch_binding_configuration_valid ? "valid" : "INVALID",
-                          (unsigned)SAFE_RELAY_STATE);
+            // so it is reported here (plus LED + startup log). Receiver
+            // reasons come from the authoritative stop mask computed in
+            // control — never rebuilt from raw fields here.
+            uint8_t reason_code = 0;
+            uint8_t recv_reasons = receiver_.receiverStopReasons();
+            if (recv_reasons & RECV_STOP_SIGNAL_LOSS) reason_code |= 1u;
+            if (recv_reasons & RECV_STOP_FAILSAFE) reason_code |= 2u;
+            if (recv_reasons & RECV_STOP_CH6) reason_code |= 4u;
+            if (recv_reasons & RECV_STOP_INVALID_INPUT) reason_code |= 32u;
+            if (!switch_binding_configuration_valid) reason_code |= 8u;
+            if (!agent_connected) reason_code |= 16u;
+            enqueueLog(LogCategory::FeatureController, 2, reason_code);
         }
         else
         {
-            Serial.printf("[SAFETY] RC features PERMITTED (target=0x%02X, last written=0x%02X, write=%s)\n",
-                          target_state, relay_board_.lastWrittenRelayStates(),
-                          write_confirmed ? "succeeded" : "FAILED");
+            enqueueLog(LogCategory::FeatureController, 3, target_state);
         }
         if (!board_actuation_ready || !rc_features_permitted)
         {
+            // IMMEDIATE edge beep: the cutoff above is already real (relays
+            // went safe this same service call via the confirmed-stop
+            // predicate) — the operator hears it now, not after the
+            // debounced state confirms seconds later. The
+            // debounced transition beeps below stay as the second,
+            // classified confirmation (300/500 ms by cause).
             relay_board_.requestStatusBeep(250); // one beep when inhibited, never repeats
+        }
+        else
+        {
+            // Permitted again before any debounced state confirmed the
+            // cutoff (bounce / glitch that cleared fast): stop the edge beep
+            // early. Relays were safe throughout; the truncated chirp itself
+            // says "transient — watch signal quality".
+            relay_board_.cancelStatusBeep();
         }
         previous_board_actuation_ready_ = board_actuation_ready;
         previous_rc_features_permitted_ = rc_features_permitted;
@@ -2101,8 +2632,7 @@ void RelayFeatureController::service(bool agent_connected)
     bool estop_switch_engaged = receiver_.isEstopSwitchEngaged();
     if (estop_switch_engaged != previous_estop_switch_engaged_)
     {
-        Serial.println(estop_switch_engaged ? "[SAFETY] WIRELESS E-STOP ENGAGED (switch LOW)"
-                                            : "[SAFETY] wireless e-stop released (switch HIGH)");
+        enqueueLog(LogCategory::FeatureController, 4, estop_switch_engaged ? 1 : 0);
         if (estop_switch_engaged)
         {
             relay_board_.requestStatusBeep(500); // one beep per engagement
@@ -2260,11 +2790,141 @@ RcReceiver rc_receiver;
 MicroRosBridge micro_ros_bridge;
 RelayFeatureController relay_feature_controller(relay_board, rc_receiver);
 
+// --- Shared state between control task (core 0) and ROS task (loop/core 1) ---
+// Synchronized handoff: the atomic agent flag is written by loop() and read
+// by control with acquire/release ordering. Snapshots flow the other way
+// via the overwrite queue above.
+std::atomic<bool> g_agent_connected{false};
+static TaskHandle_t g_control_task_handle = NULL; // set by setup(), read for diagnostics
+
+// Control task: owns RC + safety + relays. Runs independently of micro-ROS.
+// Pinned to core 0 so RC sampling and relay writes are never delayed by
+// blocking ROS operations (ping, entity lifecycle, reliable publish).
+static void controlTask(void *parameter)
+{
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    constexpr TickType_t kTickPeriodMs = pdMS_TO_TICKS(1); // 1 ms base cadence
+    constexpr uint32_t kTimingLogPeriodMs = 1000; // log timing stats once/s
+
+    uint32_t last_safety_ms = 0;
+    uint32_t last_timing_log_ms = 0;
+    uint32_t last_service_start_us = 0;
+    uint32_t max_service_gap_us = 0;   // start-to-start, micros clock
+    uint32_t max_feature_eval_us = 0;  // work duration, sleep excluded
+    uint32_t max_i2c_write_us = 0;     // actual bus transaction (getter)
+    uint32_t max_lateness_us = 0;      // wake lateness vs intended schedule
+    uint32_t service_count = 0;
+
+    for (;;)
+    {
+        vTaskDelayUntil(&xLastWakeTime, kTickPeriodMs);
+        // Work starts HERE — after the deliberate sleep. Everything below
+        // measures execution, never sleep.
+        const uint32_t work_start_us = micros();
+        // Scheduling lateness: how far past the intended wake tick we ran.
+        // xLastWakeTime was already advanced by vTaskDelayUntil; expected
+        // wake = xLastWakeTime ticks -> us. (Tick = 1 ms on this build.)
+        const uint32_t expected_wake_us = (uint32_t)xLastWakeTime * 1000u;
+        // Unsigned subtraction handles micros() wraparound; a huge value
+        // means we woke early (delayed tick update) — clamp to 0.
+        uint32_t lateness_us = work_start_us - expected_wake_us;
+        if (lateness_us < 1000000u && lateness_us > max_lateness_us)
+        {
+            max_lateness_us = lateness_us;
+        }
+
+        uint32_t now_ms = millis();
+
+        // Receiver service start-to-start gap on the micros clock.
+        if (last_service_start_us != 0)
+        {
+            const uint32_t gap_us = work_start_us - last_service_start_us;
+            if (gap_us > max_service_gap_us) max_service_gap_us = gap_us;
+        }
+        last_service_start_us = work_start_us;
+
+        // Pump i-BUS every 1 ms (required by IBUSBM_NOTIMER — upstream says
+        // loop() must be called at least every 1 ms).
+        rc_receiver.service(now_ms);
+
+        // Full safety evaluation at 50 Hz (20 ms) — well under the 100 ms budget.
+        // NOTE: "immediate" CH6 LOW stop means this evaluation, which runs
+        // at most 20 ms after the receiver decodes the endpoint.
+        if (now_ms - last_safety_ms >= 20)
+        {
+            const uint32_t feature_start_us = micros();
+            last_safety_ms = now_ms;
+
+            bool agent_conn = g_agent_connected.load(std::memory_order_acquire);
+            relay_feature_controller.service(agent_conn);
+
+            const uint32_t feature_eval_us = micros() - feature_start_us;
+            if (feature_eval_us > max_feature_eval_us) max_feature_eval_us = feature_eval_us;
+
+            // Honest I2C duration: the bus transaction itself, measured
+            // inside writeI2cRegister — not the surrounding evaluation.
+            const uint32_t i2c_write_us = relay_board.lastI2cWriteUs();
+            if (i2c_write_us > max_i2c_write_us) max_i2c_write_us = i2c_write_us;
+
+            // FRESH timestamp — captured AFTER feature evaluation so beep
+            // start time (set inside requestStatusBeep()) is never in the
+            // future relative to now_ms. This fixes the unsigned-underflow
+            // bug that silently cancelled every new beep.
+            relay_board.serviceStatusIndicators(millis());
+
+            // Publish a coherent telemetry snapshot for the ROS path — one
+            // consistent view of receiver + board state, no live reads.
+            // Includes the authoritative receiver-local stop + reasons.
+            ControlSnapshot snap{};
+            snap.captured_ms = now_ms;
+            snap.frame_sequence = rc_receiver.lastFrameCounter();
+            snap.last_valid_frame_ms = rc_receiver.lastValidFrameMs();
+            for (uint8_t index = 0; index < RC_CHANNEL_COUNT; ++index)
+            {
+                snap.channels[index] = rc_receiver.rawChannel(index);
+            }
+            snap.signature_mask = rc_receiver.signatureMask();
+            snap.receiver_state = static_cast<uint8_t>(rc_receiver.state());
+            snap.receiver_local_stop = rc_receiver.receiverLocalStop();
+            snap.receiver_stop_reasons = rc_receiver.receiverStopReasons();
+            snap.desired_mask = relay_feature_controller.lastDesiredMask();
+            snap.last_written_mask = relay_board.lastWrittenRelayStates();
+            snap.digital_inputs = relay_board.readDigitalInputs();
+            snap.relay_state_known = relay_board.isRelayStateKnown();
+            publishSnapshot(snap);
+
+            ++service_count;
+        }
+
+        // Periodic timing log (drained by loop() on core 1). All values are
+        // measured maxima over the window — reported as observed, never as
+        // a certified bound. No arbitrary compliance threshold: a "missed
+        // deadline" is not defined here; consumers judge the raw maxima.
+        if (now_ms - last_timing_log_ms >= kTimingLogPeriodMs)
+        {
+            last_timing_log_ms = now_ms;
+            enqueueLog(LogCategory::FeatureController, 5, max_service_gap_us);
+            enqueueLog(LogCategory::FeatureController, 6, max_feature_eval_us);
+            enqueueLog(LogCategory::FeatureController, 7, max_i2c_write_us);
+            enqueueLog(LogCategory::FeatureController, 8, max_lateness_us);
+            enqueueLog(LogCategory::FeatureController, 9, service_count);
+            // Stack high-water mark (words remaining) — watch for overflow.
+            enqueueLog(LogCategory::FeatureController, 10,
+                       uxTaskGetStackHighWaterMark(NULL));
+            max_service_gap_us = 0;
+            max_feature_eval_us = 0;
+            max_i2c_write_us = 0;
+            max_lateness_us = 0;
+            service_count = 0;
+        }
+    }
+}
+
 // One compact status line every 5 s (the old firmware printed per-loop —
 // drowned real events and added serial overhead to the control loop).
 constexpr uint32_t STATUS_PRINT_PERIOD_MS = 5000;
 
-void printPeriodicStatus(uint32_t now_ms)
+void printPeriodicStatus(const ControlSnapshot &snapshot, uint32_t now_ms)
 {
     static uint32_t last_status_print_ms = 0;
     if (now_ms - last_status_print_ms < STATUS_PRINT_PERIOD_MS)
@@ -2274,22 +2934,40 @@ void printPeriodicStatus(uint32_t now_ms)
     last_status_print_ms = now_ms;
 
     const char *agent_text = micro_ros_bridge.agentStateText();
+    // Receiver text from the AUTHORITATIVE stop + reasons (computed in
+    // control), never rebuilt from raw fields here.
     const char *receiver_text =
-        !rc_receiver.isSignalActive() ? (rc_receiver.isFailsafeEngaged() ? "ESTOP-FS" : "LOST")
-        : rc_receiver.isEstopSwitchEngaged()        ? "ESTOP-SW"
-        : rc_receiver.isMidZoneAmbiguityPresent()   ? "AMBIG"
-                                                    : "ACTIVE";
+        (snapshot.receiver_state !=
+         static_cast<uint8_t>(ReceiverOperatingState::SignalActive))
+            ? (snapshot.receiver_state ==
+                       static_cast<uint8_t>(ReceiverOperatingState::FailsafeEngaged)
+                   ? "ESTOP-FS"
+                   : "LOST")
+            : (snapshot.receiver_local_stop ? "STOP" : "ACTIVE");
 
     const char *config_suffix = switch_binding_configuration_valid ? "" : " CFG-INVALID";
-    Serial.printf("[STATUS] up=%lus eth=%s ip=%s agent=%s rc=%s relay=0x%02X%s%s\n",
+    uint32_t snap_age_ms = (now_ms >= snapshot.captured_ms)
+                               ? (now_ms - snapshot.captured_ms)
+                               : 0;
+    static uint32_t snap_age_max_ms = 0;
+    if (snap_age_ms > snap_age_max_ms) snap_age_max_ms = snap_age_ms;
+    // Reset the window maximum each print so it reports the worst age seen
+    // in the last 5 s, not since boot.
+    uint32_t report_age_max_ms = snap_age_max_ms;
+    snap_age_max_ms = 0;
+    uint32_t log_dropped = g_log_dropped_count.load(std::memory_order_relaxed);
+    Serial.printf("[STATUS] up=%lus eth=%s ip=%s agent=%s rc=%s relay=0x%02X%s%s snap_age=%lums snap_age_max=%lums log_dropped=%lu\n",
                   (unsigned long)(now_ms / 1000),
                   ETH.linkUp() ? "up" : "down",
                   ETH.localIP().toString().c_str(),
                   agent_text,
                   receiver_text,
-                  relay_board.lastWrittenRelayStates(),
-                  relay_board.isRelayStateKnown() ? "" : " (last write UNKNOWN)",
-                  config_suffix);
+                  snapshot.last_written_mask,
+                  snapshot.relay_state_known ? "" : " (last write UNKNOWN)",
+                  config_suffix,
+                  (unsigned long)snap_age_ms,
+                  (unsigned long)report_age_max_ms,
+                  (unsigned long)log_dropped);
 }
 
 void setup()
@@ -2328,41 +3006,104 @@ void setup()
         Serial.println("[CFG] WARNING: invalid bindings — RC-driven features INHIBITED until fixed");
     }
 
-    // 3) Ethernet + micro-ROS transport (agent connection managed in loop)
+    // 3) Ethernet + micro-ROS transport (agent connection managed in loop).
+    //    Bypassed entirely when BYPASS_MICROROS is defined.
+#ifndef BYPASS_MICROROS
     micro_ros_bridge.begin();
+#else
+    Serial.println("[BOOT] micro-ROS bypassed — running control-only");
+#endif
 
-    Serial.println("[BOOT] initialization complete — entering cooperative loop");
+    Serial.println("[BOOT] initialization complete — entering dual-task loop");
+    Serial.println("[BOOT] core 0: RC + safety (control task)");
+    Serial.println("[BOOT] core 1: micro-ROS (this loop)");
     Serial.println("[BOOT] start the agent: micro_ros_agent udp4 --port 8888");
+
+    // Create the log event queue before the control task starts so control-task
+    // code can enqueue without blocking on Serial. The queue lives on core 1
+    // (loop drains it, bounded per iteration); the control task only ever
+    // enqueues with zero wait.
+    g_log_queue = xQueueCreate(16, sizeof(LogEvent));
+
+    // Coherent telemetry snapshot queue (length one, overwrite latest).
+    // Control task publishes; loop() on core 1 consumes.
+    g_snapshot_queue = xQueueCreate(1, sizeof(ControlSnapshot));
+
+    if (!g_log_queue || !g_snapshot_queue)
+    {
+        // Init failure: safe boot output (0x00) was already commanded, but
+        // normal operation must NOT start — that would run without logging
+        // or telemetry. Report (contact state NOT verified) and halt here.
+        Serial.println("[BOOT] QUEUE CREATION FAILED — halting (relays at boot safe state, contact NOT verified)");
+        for (;;)
+        {
+            delay(1000);
+        }
+    }
+
+    // Validate the 1 ms tick period BEFORE creating the task.
+    if (pdMS_TO_TICKS(1) == 0)
+    {
+        Serial.println("[BOOT] TICK TOO COARSE (pdMS_TO_TICKS(1)==0) — halting");
+        for (;;)
+        {
+            delay(1000);
+        }
+    }
+
+    // 4) Start the control task on core 0 — RC + safety run here,
+    //    independent of micro-ROS blocking on core 1.
+    BaseType_t create_result = xTaskCreatePinnedToCore(
+        controlTask, "ControlTask", 8192, NULL, configMAX_PRIORITIES - 2,
+        &g_control_task_handle, 0);
+    if (create_result != pdPASS || !g_control_task_handle)
+    {
+        // Creation failed: safe boot output (0x00) was already commanded,
+        // but normal operation must NOT start without the control task.
+        Serial.println("[BOOT] CONTROL TASK CREATION FAILED — halting (relays at boot safe state, contact NOT verified)");
+        for (;;)
+        {
+            delay(1000);
+        }
+    }
+    Serial.printf("[BOOT] control task pinned to core 0, priority %u/%u\n",
+                  (unsigned)configMAX_PRIORITIES - 2,
+                  (unsigned)configMAX_PRIORITIES - 1);
 }
 
 void loop()
 {
-    uint32_t now_ms = millis();
+    // -----------------------------------------------------------------------
+    // ROS PATH ONLY — runs on core 1. May block (ping, entity lifecycle,
+    // reliable publish) but CANNOT delay the control task on core 0, which
+    // samples RC, evaluates features, writes relays, and updates indicators
+    // at a fixed 1 ms / 20 ms cadence regardless of what happens here.
+    // -----------------------------------------------------------------------
+    // Drain the control-task log event queue first: all Serial writes from
+    // the control path happen here, never inside the control task.
+    drainLogQueue();
 
-    // 1. i-BUS protocol pump — MUST run every iteration (byte-gap timing).
-    rc_receiver.service(now_ms);
-
-    // 2. Feature layer: dependency checks + relay actuation + indicators.
-    relay_feature_controller.service(micro_ros_bridge.isAgentConnected());
-
-    // 3. Agent connection management (throttled ping, bounded blocking).
-    //    This can discover agent loss — so feature permissions are
-    //    re-evaluated AFTER it with fresh state, never leaving a stale
-    //    "connected" decision in effect for a full loop cycle. Local RC
-    //    sampling and feature evaluation run in EVERY connection state.
+#ifndef BYPASS_MICROROS
     micro_ros_bridge.service(millis());
 
-    // 4. Re-evaluate the RC world and the feature permissions after
-    //    network work. Both services are cheap and idempotent when
-    //    nothing changed.
-    rc_receiver.service(millis());
-    relay_feature_controller.service(micro_ros_bridge.isAgentConnected());
+    // Agent availability published IMMEDIATELY after bridge servicing —
+    // before any potentially blocking telemetry — so control sees the
+    // latest agent state with minimum delay.
+    g_agent_connected.store(micro_ros_bridge.isAgentConnected(),
+                            std::memory_order_release);
+#endif
 
-    // 5. Telemetry publishing (50 Hz joy, 1 Hz health + on-change relay).
-    micro_ros_bridge.publishReceiverTelemetry(rc_receiver, millis());
-    micro_ros_bridge.publishBoardTelemetry(relay_board, rc_receiver, millis());
-
-    // 6. LED/buzzer plumbing + the throttled status line.
-    relay_board.serviceStatusIndicators(millis());
-    printPeriodicStatus(millis());
+    // Consume the coherent snapshot for telemetry + status. No live
+    // cross-core reads of RcReceiver / RelayBoard. When micro-ROS is
+    // bypassed, g_agent_connected stays false and RC-driven features are
+    // inhibited (FORCE_SAFE_ON_AGENT_LOSS).
+    ControlSnapshot snap{};
+    if (receiveSnapshot(snap))
+    {
+#ifndef BYPASS_MICROROS
+        micro_ros_bridge.publishReceiverTelemetry(snap, millis());
+        micro_ros_bridge.publishBoardTelemetry(snap, millis());
+#endif
+        printPeriodicStatus(snap, millis());
+    }
 }

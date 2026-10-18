@@ -1,0 +1,62 @@
+# BLOCK dependency view — mirrors the "FILE STRUCTURE" comment in src/main.cpp.
+# Each block is split-ready into its own .h/.cpp pair.
+direction: down
+
+title: "Firmware Blocks — src/main.cpp (5 split-ready blocks)" {
+  shape: text
+}
+
+relayboard: "BLOCK 1: RelayBoard\nrelay_board.h/.cpp\nTCA9554 + DIN + LED + buzzer\nsingle HW facade" {
+  shape: rectangle
+  style.fill: "#fff3e0"
+}
+
+rcreceiver: "BLOCK 2: RcReceiver\nrc_receiver.h/.cpp\ni-BUS + channel table\n+ failsafe state machine" {
+  shape: rectangle
+  style.fill: "#e8f5e9"
+}
+
+microros: "BLOCK 3: MicroRosBridge\nmicro_ros_bridge.h/.cpp\nagent SM + 6 publishers\nPUBLISH-ONLY, no subs" {
+  shape: rectangle
+  style.fill: "#ede7f6"
+}
+
+features: "BLOCK 4: RelayFeatureController\nrelay_feature_controller.h/.cpp\nONLY writer of relays\nbindings + dependency model" {
+  shape: rectangle
+  style.fill: "#fce4ec"
+  style.stroke-width: 3
+}
+
+main: "BLOCK 5: main\nwiring + cooperative loop()\nno logic, just service() order" {
+  shape: rectangle
+  style.fill: "#e3f2fd"
+}
+
+ibus: "lib/IBusBM\nvendored (3.x timer fix)" {
+  shape: cylinder
+  style.fill: "#f5f5f5"
+}
+
+# Dependencies (who may touch whom)
+rcreceiver -> relayboard: "observes" {
+  style.stroke-dash: 3
+}
+microros -> relayboard: "observes" {
+  style.stroke-dash: 3
+}
+microros -> rcreceiver: "observes" {
+  style.stroke-dash: 3
+}
+features -> relayboard: "WRITES\nonly path" {
+  style.stroke-width: 2
+}
+features -> rcreceiver: "reads state"
+main -> rcreceiver: "service()"
+main -> features: "service()"
+main -> microros: "service()"
+ibus -> rcreceiver: "uses"
+
+rule: "RULE: feature layer never touches Wire/pins/registers" {
+  shape: text
+  style.font-color: "#b71c1c"
+}

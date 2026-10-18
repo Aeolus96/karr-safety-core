@@ -1,0 +1,22 @@
+# Cooperative loop() — order matters. See loop() at bottom of src/main.cpp.
+# D2 sequence diagram: actors with shape: sequence_diagram.
+shape: sequence_diagram
+
+title: "loop() — cooperative order (every iteration)" {
+  shape: text
+}
+
+main: "main loop()"
+rc: "RcReceiver"
+feat: "RelayFeatureController"
+bridge: "MicroRosBridge"
+board: "RelayBoard"
+
+main -> rc: "1. service(now) — i-BUS pump (MUST run every iter)"
+main -> feat: "2. service(agent_connected) — deps + relay write"
+main -> bridge: "3. service(now) — ping + entity SM (bounded ≤100ms)"
+main -> rc: "4. service(now) — re-sample after network work"
+main -> feat: "4b. service(fresh agent state) — no stale decision"
+main -> bridge: "5a. publishReceiverTelemetry 50Hz /rc/joy"
+main -> bridge: "5b. publishBoardTelemetry 1Hz + on-change relay_state"
+main -> board: "6. serviceStatusIndicators + status line"

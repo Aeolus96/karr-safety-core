@@ -24,10 +24,10 @@ live with their feature block, not at the top of the file.
    not confirmed contacts — see "Dependency model" below):
    - BOARD-level: relay hardware initialized.
    - RC-driven features (today's only group): RC frames fresh
-     (<=200 ms — the code accepts exactly 200 ms), no 2-pos switch in the
-     mid-zone, e-stop channel (ch6) showing a VALID HIGH (released)
-     position, agent connected (`FORCE_SAFE_ON_AGENT_LOSS=true`), binding
-     table valid.
+     (<=200 ms — the code accepts exactly 200 ms), NO confirmed
+     receiver-local stop (signal loss, confirmed failsafe signature,
+     decoded ch6 stop, persistent invalid input), agent connected
+     (`FORCE_SAFE_ON_AGENT_LOSS=true`), binding table valid.
    LED: red SOLID = relay bus fault · red blink = agent unavailable (ROS
    connectivity) · yellow blink = receiver-local inhibition (RC
    features) · purple blink = invalid RC binding config · green = no
@@ -136,16 +136,15 @@ Composition flow (same diagram in the BLOCK 4 header):
   is deliberately changed.
 
 - **RC-group permission** (today's only feature group) requires ALL of:
-  RC frames fresh (<=200 ms — the code accepts exactly 200 ms), no
-  2-position switch in the 1250-1750 mid-zone (checked
-  EVERY cycle — ambiguity is not permission), the wireless e-stop switch
-  (ch6) showing a VALID HIGH (released) position, the agent connected
+  RC frames fresh (<=200 ms — the code accepts exactly 200 ms), NO
+  confirmed receiver stop (see e-stop layers below), the agent connected
   (`FORCE_SAFE_ON_AGENT_LOSS=true`), and a valid RC binding table. Board
   level: relay hardware initialized. One predicate,
-  `RcReceiver::isLocallyInhibited()`, covers signal loss + failsafe +
-  ambiguity + e-stop switch — the permission check, `/relay_board/estop`
-  and the LED policy all consult it so they can never disagree about
-  receiver-local state.
+  `RcReceiver::isLocallyInhibited()`, covers signal loss + confirmed
+  failsafe + decoded CH6 stop + persistent invalid input — the permission
+  check, `/relay_board/estop` and the LED policy all consult it so they can
+  never disagree about receiver-local state. Brief intermediate input or an
+  unconfirmed signature NEVER inhibits by itself.
 - **Relay initialization invariant** (separate from cached state):
   `relay_initialized_` = the full safe sequence (output latch write, THEN
   direction write — in that order, aborting if the latch fails) succeeded
@@ -167,21 +166,37 @@ Composition flow (same diagram in the BLOCK 4 header):
 - **Write retry policy**: ordinary target changes do NOT bypass fault retry
   limits; only a NEW transition to SAFE gets one immediate attempt;
   subsequent failed attempts of the same target stay rate-limited (200 ms).
-- **E-stop layers** (any one inhibits RC-driven features):
-  1. Wireless e-stop switch ch6: ENGAGED unless a VALID HIGH position
-     (>1750 within 900..2100) is shown. Failsafe (1500), implausible values
-     and "no data yet" (0) all read ENGAGED — only a deliberate valid
-     switch-HIGH releases. The board ALWAYS starts inhibited (boot is never
+- **E-stop layers** (any one inhibits RC-driven features). "Immediate" CH6
+  LOW means the next nominal 20 ms feature evaluation, not necessarily the
+  same 1 ms iteration that decoded it:
+  1. Wireless e-stop switch ch6, DECODED with intermediate grace: valid LOW
+     engages at once; valid HIGH releases at once; brief intermediate input
+     preserves the previous decoded stop state for at most
+     INTERMEDIATE_GRACE_MS (200 ms provisional, separately named policy);
+     implausible values and "no data yet" (0) read ENGAGED without grace;
+     no prior valid state reads ENGAGED. Only a deliberate valid HIGH
+     releases. The board ALWAYS starts inhibited (boot is never
      an "e-stopped" event — no engagement is required): a valid HIGH is
-     accepted immediately, with no rearm transition required.
-  2. Receiver failsafe signature: any 2-position switch parked mid-zone for
-     >200 ms. The all-channel-1500 failsafe is the TESTED transmitter
-     configuration's observed behavior — it parks a 2-pos switch inside
-     1250-1750, where a healthy switch never rests (1000/2000 only); this
-     is not a universal i-BUS failsafe property. RC-driven features are
-     inhibited on the FIRST ambiguous sample; the announced
-     FailsafeEngaged state (beep) is debounced at 200 ms so switch bounce
-     cannot spurious-trip it.
+     accepted immediately, with no rearm transition required. Persistently
+     intermediate CH6 (grace expired) engages receiver-local stop.
+  2. Receiver failsafe signature: a 2-position channel (ch5/ch6/ch9/ch10)
+     inside the NARROW 1490-1510 window in fresh frames starts per-channel
+     confirmation (timer starts on ENTRY, never restarts on wobble); 200 ms
+     of continuous fresh-frame window evidence confirms that channel
+     (FAILSAFE_CONFIRM_MS, provisional). The all-channel-1500 failsafe is
+     the TESTED transmitter configuration's observed behavior — it parks a
+     2-pos switch inside the window, where a healthy switch never rests
+     (1000/2000 only); this is not a universal i-BUS failsafe property and
+     the tolerance is NOT protocol-defined — verify transmitter-off,
+     startup, and reconnection on the bench. Confirmation is per-channel
+     (no shared timer); leaving the window resets that channel's
+     confirmation but does NOT grant permission. Clearing one channel never
+     clears another channel, CH6 stop, invalid input, or frame loss.
+     Recovery requires fresh VALID replacement evidence (an endpoint) for
+     the affected channel. Ordinary brief transitions never cut outputs;
+     each feature request retains its channel's last valid endpoint while
+     intermediate (bounded by INTERMEDIATE_GRACE_MS), then latches a
+     distinct InvalidSwitchInput receiver-local stop.
   3. Frame loss: no i-BUS frames decoded for >200 ms (RF loss, receiver
      power, or a UART wiring fault — indistinguishable at this layer), or
      ch6 below 980 (receiver unbound).
@@ -325,40 +340,65 @@ Composition flow (same diagram in the BLOCK 4 header):
   either "all off" or "ignored by independent features".
 
 
-## Failsafe detection (new vs prototype)
-
-Prototype only checked raw values; IBusBM keeps returning the LAST values
-forever after the receiver dies. Evaluation (matches the diagram in
-`RcReceiver::service`):
+## Failsafe detection (confirmation-gated, per-channel)
 
     Decoded frames fresh AND ch6 not below unbound threshold?
         |
-        +-- No --> SignalLost --> RC-dependent features inhibited
+        +-- No --> SignalLost ---> receiver-local stop (signal loss)
         |
-        +-- Yes --> Any configured 2-position switch in mid-zone?
+        +-- Yes --> Any 2-pos channel with CONFIRMED signature?
                         |
-                        +-- Yes --> immediate RC-local inhibit
-                        |              |
-                        |              +-- persists >200 ms?
-                        |                      +-- Yes --> FailsafeEngaged
+                        +-- Yes --> FailsafeEngaged -> stop (failsafe)
                         |
-                        +-- No --> receiver state may be SignalActive
+                        +-- No --> SignalActive (liveness); stop still
+                                   applies for decoded CH6 stop or
+                                   persistent invalid input.
 
-    Separately: ch6 not a plausible HIGH position --> wireless stop engaged
+    Brief intermediate / unconfirmed signature NEVER stops by itself.
 
-    Receiver-local inhibit =
-        signal not active OR mid-zone ambiguity OR wireless stop engaged
+Behavior table (bench patch — provisional timings, not a validated safety
+configuration):
+
+| Input condition | Behavior |
+|---|---|
+| Ordinary 2-pos switch reaches a valid endpoint | Its own relay request updates at the next 20 ms evaluation |
+| 3-pos switch (ch7/ch8) reaches a valid endpoint | Its own relay request updates at the next 20 ms evaluation |
+| 3-pos switch rests in the MID zone (or reads implausible) past 200 ms grace | Effective value resolves to canonical MID (inactive) — never failsafe evidence, never an invalid-input stop |
+| Ordinary switch briefly enters the narrow signature window | Start per-channel confirmation; retain last valid endpoint; no global cutoff |
+| Signature present in valid new frames for 200 ms | Confirmed failsafe for that channel; safe mask (0x00) |
+| CH6 reaches valid LOW | Engage stop at the next control evaluation (no 200 ms wait) |
+| CH6 reaches valid HIGH | Release switch-stop, subject to other permissions |
+| CH6 briefly intermediate | Preserve previous decoded stop state, at most 200 ms grace |
+| No valid frames for the receiver timeout | Stop independently of signature confirmation |
+| Implausible or persistently undecodable CH6 | Stop without grace; never retain "released" |
+| Ordinary 2-pos channel persistently intermediate past grace | Distinct InvalidSwitchInput receiver-local stop |
+| CH6 at 1500 with no previous endpoint | Remains stopped (boots stopped) |
+| CH6 alternating 1500/1400 | Grace starts on first entry, never restarts — expires once |
+| Signature moves to non-signature intermediate | Signature confirmation resets; intermediate episode continues; NOT permission |
+| One channel clears | Other channels' flags, CH6 stop, invalid input, frame loss all unaffected |
 
 The tested transmitter configuration outputs 1500 on all channels during
 failsafe (observed behavior of THIS i6S/iA6B setup — not a universal i-BUS
-failsafe property). A configured two-position switch in the mid-zone
-immediately inhibits RC-dependent operation; persistent ambiguity is
-reported as FailsafeEngaged only after the 200 ms debounce interval —
-distinct from sub-200 ms switch bounce. Joysticks/3-pos channels are
-excluded (1500 is legitimate there). Frame-counter stall >200 ms = loss;
-the buffered-UART freshness limitation is documented in
-`RcReceiver::service` — validate RC loss during network work, not only on
-an idle connection.
+failsafe property). Only the NARROW 1490-1510 window is signature evidence;
+ordinary mid-zone samples are intermediate input with retained endpoints.
+Confirmation is per-channel across ch5/ch6/ch9/ch10 (ch7/ch8 excluded — a
+legitimate middle position is not failsafe evidence there). ch7/ch8 feed
+only their effective feature value: a valid endpoint updates the bound
+relay at the next 20 ms evaluation, a brief sweep retains the previous
+value, and a sustained MID-zone rest resolves to inactive after the same
+200 ms grace. Confirm on the bench that the transmitter-off signature
+actually appears on all four; do
+NOT require all four simultaneously to declare failsafe. IBusBM keeps
+delivering receiver frames after RF loss, so the frame counter alone cannot
+replace failsafe-value detection. A frame arriving after a long service gap
+resets all per-channel evidence before its own values are processed — old
+evidence is never treated as uninterrupted confirmation. Frame-counter
+stall >200 ms = loss; the buffered-UART freshness limitation is documented
+in `RcReceiver::service` — validate RC loss during network work, not only
+on an idle connection. Provisional 200 ms timings are a policy choice, not
+a demonstrated safe stopping-time requirement: actual RF-loss response is
+receiver detection/output delay + firmware confirmation + control
+scheduling — measure transmitter-loss to safe-mask write on the bench.
 
 ## IBusBM: registry vs local — DIFFERENCE FOUND
 
@@ -412,8 +452,9 @@ packages + bridge).
 
 **Rule**: diagnostics OBSERVE control behavior, never determine it — a
 diagnostics failure must not disable relay features. Candidate status
-groups: relay initialization/write failures · RC freshness, ambiguity,
-wireless stop · ROS connection, publication failures, cleanup
+groups: relay initialization/write failures · RC freshness, confirmed
+failsafe, wireless stop, invalid input · ROS connection, publication
+failures, cleanup
 abandonments · configuration validity · feature-specific
 inhibition/fallback.
 
@@ -426,7 +467,8 @@ inhibition/fallback.
 | RC loss | RC-dependent features enter their defined inhibited state (bits to 0x00) |
 | RC loss + independent safety indication (future) | indication continues per its own policy |
 | RC recovery with active switch | current baseline feature resumes — no global rearm gesture |
-| Brief 2-position mid-zone sample | immediate RC-local inhibit, no premature FailsafeEngaged announcement |
+| Brief 2-position intermediate sample | endpoint retained — NO cutoff; grace expiry (>200 ms) → InvalidSwitchInput stop; no premature FailsafeEngaged announcement |
+| Signature confirmed on one channel | that channel stops; clearing it never clears other channels, CH6 stop, invalid input, or frame loss |
 | RC loss during reconnect/teardown | timeout still triggers without indefinite delay |
 | Relay write failure | truthful fault reporting + existing rate-limited recovery |
 | Invalid RC binding | no invalid actuation; unrelated feature groups unaffected (config scope) |
